@@ -1,0 +1,12 @@
+name = "subconverter-loadbalancer"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "subconverter-db"
+database_id = "6dee22e7-5466-4bb7-89ea-72783a242e44"
+
+# Observability 配置
+[observability]
+enabled = true

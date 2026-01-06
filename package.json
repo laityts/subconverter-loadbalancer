@@ -1,0 +1,22 @@
+{
+  "name": "subconverter-loadbalancer",
+  "version": "1.0.0",
+  "description": "Subscription converter load balancer for Cloudflare Workers",
+  "main": "worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "subconverter",
+    "loadbalancer",
+    "cloudflare",
+    "worker"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
