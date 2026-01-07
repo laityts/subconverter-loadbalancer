@@ -6,9 +6,9 @@ const BEIJING_TIMEZONE = 'Asia/Shanghai';
 
 // 默认后端地址
 const DEFAULT_BACKENDS = [
+  'https://url.v1.mk',
   'https://subapi.cmliussss.net',
-  'https://subapi.sosoorg.com',
-  'https://url.v1.mk'
+  'https://subapi.sosoorg.com'
 ];
 
 // 权重配置
@@ -1940,6 +1940,7 @@ async function handleInitPage(request, env) {
           --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
           --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
           --warning-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+          --danger-gradient: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);
           --card-bg: rgba(255, 255, 255, 0.95);
           --text-primary: #2d3748;
           --text-secondary: #718096;
@@ -2261,6 +2262,145 @@ async function handleInitPage(request, env) {
           box-shadow: 0 8px 25px rgba(245, 87, 108, 0.5);
         }
         
+        /* 自定义模态框样式 */
+        .modal-overlay {
+          position: fixed;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          background: rgba(0, 0, 0, 0.7);
+          display: none;
+          align-items: center;
+          justify-content: center;
+          z-index: 1000;
+          backdrop-filter: blur(5px);
+          animation: fadeIn 0.3s ease;
+        }
+        
+        .modal-content {
+          background: white;
+          border-radius: 20px;
+          padding: 40px;
+          max-width: 500px;
+          width: 90%;
+          box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
+          animation: slideIn 0.4s ease;
+          position: relative;
+        }
+        
+        .modal-header {
+          text-align: center;
+          margin-bottom: 25px;
+        }
+        
+        .modal-icon {
+          width: 70px;
+          height: 70px;
+          background: var(--danger-gradient);
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          margin: 0 auto 20px;
+          color: white;
+          font-size: 28px;
+          box-shadow: 0 10px 20px rgba(245, 87, 108, 0.3);
+        }
+        
+        .modal-title {
+          font-size: 24px;
+          font-weight: 700;
+          color: #e53e3e;
+          margin-bottom: 10px;
+        }
+        
+        .modal-body {
+          color: var(--text-primary);
+          line-height: 1.6;
+          margin-bottom: 30px;
+          text-align: center;
+        }
+        
+        .modal-warning {
+          background: linear-gradient(135deg, #fff5f5 0%, #fed7d7 100%);
+          border-radius: 12px;
+          padding: 20px;
+          margin: 20px 0;
+          border: 1px solid #feb2b2;
+        }
+        
+        .modal-warning h4 {
+          color: #742a2a;
+          margin-bottom: 10px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        
+        .modal-warning ul {
+          list-style: none;
+          padding: 0;
+          margin: 10px 0;
+        }
+        
+        .modal-warning li {
+          padding: 8px 0;
+          color: #742a2a;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+        
+        .modal-warning li i {
+          color: #e53e3e;
+          font-size: 12px;
+        }
+        
+        .modal-actions {
+          display: flex;
+          gap: 15px;
+          justify-content: center;
+        }
+        
+        .modal-btn {
+          padding: 15px 30px;
+          border: none;
+          border-radius: 10px;
+          font-size: 16px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.3s ease;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 10px;
+          flex: 1;
+        }
+        
+        .modal-btn-cancel {
+          background: white;
+          color: var(--text-primary);
+          border: 2px solid var(--border-color);
+        }
+        
+        .modal-btn-cancel:hover {
+          background: #f7fafc;
+          transform: translateY(-2px);
+          box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+        
+        .modal-btn-confirm {
+          background: var(--danger-gradient);
+          color: white;
+          box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4);
+        }
+        
+        .modal-btn-confirm:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 8px 25px rgba(245, 87, 108, 0.5);
+        }
+        
         .spinner {
           animation: spin 1s linear infinite;
         }
@@ -2291,6 +2431,19 @@ async function handleInitPage(request, env) {
           .btn {
             padding: 16px 20px;
             font-size: 15px;
+          }
+          
+          .modal-content {
+            padding: 30px 20px;
+            width: 95%;
+          }
+          
+          .modal-actions {
+            flex-direction: column;
+          }
+          
+          .modal-btn {
+            width: 100%;
           }
         }
         
@@ -2332,6 +2485,31 @@ async function handleInitPage(request, env) {
           }
           
           .btn-secondary:hover {
+            background: #5a6778;
+          }
+          
+          .modal-content {
+            background: #2d3748;
+            color: #f7fafc;
+          }
+          
+          .modal-warning {
+            background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
+            border: 1px solid #742a2a;
+          }
+          
+          .modal-warning h4,
+          .modal-warning li {
+            color: #feb2b2;
+          }
+          
+          .modal-btn-cancel {
+            background: #4a5568;
+            color: #f7fafc;
+            border-color: #4a5568;
+          }
+          
+          .modal-btn-cancel:hover {
             background: #5a6778;
           }
         }
@@ -2404,7 +2582,7 @@ async function handleInitPage(request, env) {
             <button class="btn btn-primary" onclick="location.href='/status'">
               <i class="fas fa-chart-bar"></i> 前往状态监控面板
             </button>
-            <button class="btn btn-warning" onclick="showResetConfirm()">
+            <button class="btn btn-warning" onclick="showResetModal()">
               <i class="fas fa-redo"></i> 重置数据库
             </button>
             <button class="btn btn-secondary" onclick="location.href='/'">
@@ -2414,7 +2592,66 @@ async function handleInitPage(request, env) {
         </div>
       </div>
       
+      <!-- 重置数据库确认模态框 -->
+      <div id="reset-modal" class="modal-overlay">
+        <div class="modal-content">
+          <div class="modal-header">
+            <div class="modal-icon">
+              <i class="fas fa-exclamation-triangle"></i>
+            </div>
+            <h3 class="modal-title">确认重置数据库</h3>
+          </div>
+          
+          <div class="modal-body">
+            <p>此操作将删除所有现有数据，包括：</p>
+            
+            <div class="modal-warning">
+              <h4><i class="fas fa-skull-crossbones"></i> 将被删除的数据</h4>
+              <ul>
+                <li><i class="fas fa-times-circle"></i> 所有后端服务器配置</li>
+                <li><i class="fas fa-times-circle"></i> 所有请求历史记录</li>
+                <li><i class="fas fa-times-circle"></i> 所有性能统计数据</li>
+              </ul>
+            </div>
+            
+            <p><strong>重置后系统将恢复到默认配置（${DEFAULT_BACKENDS.length}个后端服务器）。</strong></p>
+            <p style="color: var(--text-secondary); font-size: 14px; margin-top: 15px;">
+              此操作不可撤销，请谨慎操作！
+            </p>
+          </div>
+          
+          <div class="modal-actions">
+            <button class="modal-btn modal-btn-cancel" onclick="closeResetModal()">
+              <i class="fas fa-times"></i> 取消操作
+            </button>
+            <button class="modal-btn modal-btn-confirm" onclick="resetDatabase()">
+              <i class="fas fa-check"></i> 确认重置
+            </button>
+          </div>
+        </div>
+      </div>
+      
       <script>
+        // 模态框控制
+        function showResetModal() {
+          const modal = document.getElementById('reset-modal');
+          modal.style.display = 'flex';
+          document.body.style.overflow = 'hidden';
+        }
+        
+        function closeResetModal() {
+          const modal = document.getElementById('reset-modal');
+          modal.style.display = 'none';
+          document.body.style.overflow = 'auto';
+        }
+        
+        // 点击模态框外部关闭
+        document.getElementById('reset-modal').addEventListener('click', function(e) {
+          if (e.target === this) {
+            closeResetModal();
+          }
+        });
+        
         function showMessage(text, type, icon = 'info-circle') {
           const messageDiv = document.getElementById('message');
           messageDiv.className = 'message ' + type;
@@ -2489,32 +2726,9 @@ async function handleInitPage(request, env) {
           }
         }
         
-        function showResetConfirm() {
-          const confirmHTML = \`
-            <div style="text-align: left; margin-bottom: 20px;">
-              <h3 style="margin-bottom: 10px; color: #e53e3e;">
-                <i class="fas fa-exclamation-triangle"></i> 确认重置数据库
-              </h3>
-              <p style="color: var(--text-secondary); line-height: 1.5;">
-                此操作将删除所有现有数据，包括：
-              </p>
-              <ul style="color: var(--text-secondary); margin: 10px 0 10px 20px;">
-                <li>所有后端服务器配置</li>
-                <li>所有请求历史记录</li>
-                <li>所有性能统计数据</li>
-              </ul>
-              <p style="color: var(--text-secondary);">
-                重置后系统将恢复到默认配置。
-              </p>
-            </div>
-          \`;
-          
-          if (confirm(confirmHTML.replace(/<[^>]*>/g, ''))) {
-            resetDatabase();
-          }
-        }
-        
         async function resetDatabase() {
+          closeResetModal();
+          
           try {
             showMessage('正在重置数据库，请稍候...', 'success', 'spinner');
             
@@ -2567,9 +2781,14 @@ async function handleInitPage(request, env) {
             }
           }
           
-          // Escape 键返回状态页面
+          // Escape 键关闭模态框或返回状态页面
           if (e.key === 'Escape') {
-            location.href = '/status';
+            const modal = document.getElementById('reset-modal');
+            if (modal.style.display === 'flex') {
+              closeResetModal();
+            } else {
+              location.href = '/status';
+            }
           }
         });
         
