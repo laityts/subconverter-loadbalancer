@@ -542,13 +542,13 @@ async function logRequest(env, data) {
     
     logDebug('请求日志插入成功');
     
-    // 清理旧的日志（保留最近1000条）
+    // 清理旧的日志（保留最近100条）
     await env.DB.prepare(`
       DELETE FROM request_logs 
       WHERE id NOT IN (
         SELECT id FROM request_logs 
         ORDER BY request_time DESC 
-        LIMIT 1000
+        LIMIT 100
       )
     `).run();
     
@@ -1484,7 +1484,7 @@ async function handleStatusPage(request, env, isInitialized) {
             <div class="info-item">
               <h3 style="color: var(--text-secondary); font-size: 14px; margin-bottom: 8px;">数据统计</h3>
               <p style="font-size: 16px; font-weight: 500;">
-                保留最近 <strong>1000</strong> 条日志
+                保留最近 <strong>100</strong> 条日志
               </p>
               <p style="font-size: 13px; color: var(--text-secondary);">
                 基于动态权重智能选择
