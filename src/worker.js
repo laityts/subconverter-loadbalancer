@@ -5,10 +5,7 @@
 const BEIJING_TIMEZONE = 'Asia/Shanghai';
 
 // 默认后端地址
-// https://sub.xeton.dev
-// https://api.wcc.best
 const DEFAULT_BACKENDS = [
-  'https://www.nameless13.com',
   'https://subapi.cmliussss.net',
   'https://subapi.sosoorg.com',
   'https://url.v1.mk'
@@ -1211,6 +1208,12 @@ async function handleStatusPage(request, env, isInitialized) {
             font-size: 14px;
             color: var(--text-primary);
           }
+          
+          /* 修改：移动端副标题居中 */
+          .title-section p {
+            text-align: center;
+            width: 100%;
+          }
         }
         
         /* 亮色/暗色主题切换支持 */
@@ -1252,7 +1255,6 @@ async function handleStatusPage(request, env, isInitialized) {
               <h1>
                 <i class="fas fa-balance-scale"></i>
                 订阅转换负载均衡系统
-                <span class="badge">v1.0.0</span>
               </h1>
               <p>智能加权轮询 | 实时监控 | 性能统计</p>
             </div>
