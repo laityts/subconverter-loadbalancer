@@ -562,6 +562,127 @@ async function logRequest(env, data) {
   }
 }
 
+// API: 获取后端统计
+async function handleBackendStats(request, env) {
+  logDebug('开始获取后端统计');
+  try {
+    // 添加时间戳避免缓存
+    const startTime = Date.now();
+    
+    const result = await env.DB.prepare(`
+      SELECT 
+        id, url, weight, dynamic_weight,
+        total_requests, success_count, fail_count,
+        average_response_time, last_response_time,
+        last_used, enabled,
+        created_at
+      FROM backend_servers
+      ORDER BY dynamic_weight DESC
+    `).all();
+    
+    const endTime = Date.now();
+    logDebug(`获取后端统计成功: 找到${result.results?.length || 0}条记录, 耗时${endTime - startTime}ms`);
+    
+    // 确保返回的是数组
+    const data = result.results || [];
+    
+    // 格式化数据，确保所有字段都有值
+    const formattedData = data.map(backend => ({
+      id: backend.id || 0,
+      url: backend.url || '未知',
+      weight: backend.weight || INITIAL_WEIGHT,
+      dynamic_weight: backend.dynamic_weight || backend.weight || INITIAL_WEIGHT,
+      total_requests: backend.total_requests || 0,
+      success_count: backend.success_count || 0,
+      fail_count: backend.fail_count || 0,
+      average_response_time: backend.average_response_time || 0,
+      last_response_time: backend.last_response_time || 0,
+      last_used: backend.last_used || null,
+      enabled: backend.enabled !== undefined ? backend.enabled : 1,
+      created_at: backend.created_at || new Date().toISOString()
+    }));
+    
+    return new Response(JSON.stringify(formattedData), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+      }
+    });
+    
+  } catch (error) {
+    logError('获取后端统计时发生错误', error);
+    return new Response(JSON.stringify({
+      error: error.message,
+      stack: error.stack,
+      timestamp: new Date().toISOString()
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store'
+      }
+    });
+  }
+}
+
+// API: 获取最近请求
+async function handleRecentRequests(request, env) {
+  logDebug('开始获取最近请求');
+  try {
+    const result = await env.DB.prepare(`
+      SELECT 
+        id, backend_url, response_time, status, error_message, request_time,
+        created_at
+      FROM request_logs
+      ORDER BY request_time DESC
+      LIMIT 20
+    `).all();
+    
+    logDebug(`获取最近请求成功: 找到${result.results?.length || 0}条记录`);
+    
+    // 确保返回的是数组
+    const data = result.results || [];
+    
+    // 格式化数据
+    const formattedData = data.map(log => ({
+      id: log.id || 0,
+      backend_url: log.backend_url || '未知',
+      response_time: log.response_time || 0,
+      status: log.status || 'unknown',
+      error_message: log.error_message || '',
+      request_time: log.request_time || new Date().toISOString(),
+      created_at: log.created_at || new Date().toISOString()
+    }));
+    
+    return new Response(JSON.stringify(formattedData), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
+      }
+    });
+    
+  } catch (error) {
+    logError('获取最近请求时发生错误', error);
+    return new Response(JSON.stringify({
+      error: error.message,
+      stack: error.stack,
+      timestamp: new Date().toISOString()
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store'
+      }
+    });
+  }
+}
+
 // 状态页面
 async function handleStatusPage(request, env, isInitialized) {
   logInfo('处理状态页面请求');
@@ -578,6 +699,39 @@ async function handleStatusPage(request, env, isInitialized) {
     }
   }
   
+  // 获取数据用于初始渲染（避免完全依赖客户端JavaScript）
+  let backendStats = [];
+  let recentRequests = [];
+  
+  try {
+    const statsResult = await env.DB.prepare(`
+      SELECT 
+        id, url, weight, dynamic_weight,
+        total_requests, success_count, fail_count,
+        average_response_time, last_response_time,
+        last_used, enabled
+      FROM backend_servers
+      ORDER BY dynamic_weight DESC
+      LIMIT 10
+    `).all();
+    
+    backendStats = statsResult.results || [];
+    
+    const logsResult = await env.DB.prepare(`
+      SELECT 
+        backend_url, response_time, status, error_message, request_time
+      FROM request_logs
+      ORDER BY request_time DESC
+      LIMIT 10
+    `).all();
+    
+    recentRequests = logsResult.results || [];
+  } catch (error) {
+    logError('获取状态页面初始数据失败', error);
+    // 继续渲染页面，客户端JavaScript会重新加载
+  }
+  
+  // 美化后的HTML
   const html = `
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -586,7 +740,23 @@ async function handleStatusPage(request, env, isInitialized) {
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>订阅转换负载均衡 - 状态监控</title>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
       <style>
+        :root {
+          --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          --secondary-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+          --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+          --card-bg: rgba(255, 255, 255, 0.95);
+          --text-primary: #2d3748;
+          --text-secondary: #718096;
+          --border-color: #e2e8f0;
+          --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.1);
+          --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+          --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.1);
+          --radius-md: 12px;
+          --radius-lg: 16px;
+        }
+        
         * {
           margin: 0;
           padding: 0;
@@ -594,315 +764,702 @@ async function handleStatusPage(request, env, isInitialized) {
         }
         
         body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
           min-height: 100vh;
+          color: var(--text-primary);
+          line-height: 1.6;
           padding: 20px;
         }
         
         .container {
-          max-width: 1200px;
+          max-width: 1400px;
           margin: 0 auto;
         }
         
+        /* 头部样式 */
         .header {
-          background: white;
-          border-radius: 10px;
+          background: var(--card-bg);
+          border-radius: var(--radius-lg);
           padding: 30px;
-          margin-bottom: 20px;
-          box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+          margin-bottom: 30px;
+          box-shadow: var(--shadow-lg);
+          backdrop-filter: blur(10px);
+          border: 1px solid rgba(255, 255, 255, 0.2);
         }
         
-        h1 {
-          color: #333;
-          margin-bottom: 10px;
+        .header-content {
           display: flex;
+          justify-content: space-between;
           align-items: center;
-          gap: 10px;
+          flex-wrap: wrap;
+          gap: 20px;
         }
         
-        h1 i {
-          color: #667eea;
+        .title-section h1 {
+          font-size: 28px;
+          font-weight: 700;
+          background: var(--primary-gradient);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          margin-bottom: 8px;
         }
         
-        .subtitle {
-          color: #666;
+        .title-section p {
+          color: var(--text-secondary);
           font-size: 16px;
         }
         
-        .stats-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-          gap: 20px;
-          margin-bottom: 20px;
-        }
-        
-        .card {
-          background: white;
-          border-radius: 10px;
-          padding: 20px;
-          box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
-        
-        .card h2 {
-          color: #444;
-          margin-bottom: 20px;
-          padding-bottom: 10px;
-          border-bottom: 2px solid #f0f0f0;
-          display: flex;
-          align-items: center;
-          gap: 10px;
-        }
-        
-        .card h2 i {
-          color: #667eea;
-        }
-        
-        .stats-table {
-          width: 100%;
-          border-collapse: collapse;
-        }
-        
-        .stats-table th {
-          background: #f8f9fa;
-          color: #495057;
+        .badge {
+          display: inline-block;
+          padding: 4px 12px;
+          background: var(--success-gradient);
+          color: white;
+          border-radius: 20px;
+          font-size: 14px;
           font-weight: 600;
-          text-align: left;
-          padding: 12px;
-          border-bottom: 2px solid #dee2e6;
+          margin-left: 10px;
         }
         
-        .stats-table td {
-          padding: 12px;
-          border-bottom: 1px solid #dee2e6;
-        }
-        
-        .stats-table tr:hover {
-          background: #f8f9fa;
-        }
-        
-        .status-badge {
-          padding: 4px 8px;
-          border-radius: 12px;
-          font-size: 12px;
-          font-weight: 600;
-        }
-        
-        .status-success {
-          background: #d4edda;
-          color: #155724;
-        }
-        
-        .status-failed {
-          background: #f8d7da;
-          color: #721c24;
-        }
-        
-        .progress-bar {
-          width: 100%;
-          height: 6px;
-          background: #e9ecef;
-          border-radius: 3px;
-          overflow: hidden;
-          margin-top: 5px;
-        }
-        
-        .progress-fill {
-          height: 100%;
-          background: #28a745;
-          transition: width 0.3s ease;
-        }
-        
-        .actions {
+        /* 按钮组 */
+        .action-buttons {
           display: flex;
-          gap: 10px;
-          margin-top: 20px;
+          gap: 12px;
+          flex-wrap: wrap;
         }
         
         .btn {
-          padding: 10px 20px;
+          padding: 12px 24px;
           border: none;
-          border-radius: 5px;
+          border-radius: 8px;
           font-size: 14px;
           font-weight: 600;
           cursor: pointer;
           transition: all 0.3s ease;
-          display: flex;
+          display: inline-flex;
           align-items: center;
-          gap: 5px;
+          gap: 8px;
+          text-decoration: none;
         }
         
         .btn-primary {
-          background: #667eea;
+          background: var(--primary-gradient);
           color: white;
         }
         
         .btn-primary:hover {
-          background: #5a67d8;
           transform: translateY(-2px);
-          box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+          box-shadow: var(--shadow-md);
         }
         
         .btn-secondary {
-          background: #6c757d;
-          color: white;
+          background: white;
+          color: var(--text-primary);
+          border: 1px solid var(--border-color);
         }
         
         .btn-secondary:hover {
-          background: #5a6268;
+          background: #f7fafc;
           transform: translateY(-2px);
-          box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+          box-shadow: var(--shadow-md);
         }
         
-        .loading {
-          text-align: center;
-          padding: 40px;
-          color: #666;
-        }
-        
-        .loading i {
-          animation: spin 1s linear infinite;
-        }
-        
-        .empty-state {
-          text-align: center;
-          padding: 40px;
-          color: #666;
-        }
-        
-        .error-state {
-          text-align: center;
-          padding: 40px;
-          color: #dc3545;
-          background: #f8d7da;
-          border-radius: 8px;
-          margin: 10px 0;
-        }
-        
-        .debug-info {
-          background: #f8f9fa;
-          border-radius: 8px;
-          padding: 15px;
-          margin-top: 20px;
-          font-size: 12px;
-          color: #666;
-          max-height: 200px;
-          overflow-y: auto;
-        }
-        
-        @keyframes spin {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
+        /* 统计卡片网格 */
+        .stats-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+          gap: 25px;
+          margin-bottom: 30px;
         }
         
         @media (max-width: 768px) {
           .stats-grid {
             grid-template-columns: 1fr;
           }
+        }
+        
+        /* 卡片样式 */
+        .card {
+          background: var(--card-bg);
+          border-radius: var(--radius-lg);
+          padding: 30px;
+          box-shadow: var(--shadow-lg);
+          backdrop-filter: blur(10px);
+          border: 1px solid rgba(255, 255, 255, 0.2);
+          transition: transform 0.3s ease;
+        }
+        
+        .card:hover {
+          transform: translateY(-5px);
+        }
+        
+        .card-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 25px;
+          padding-bottom: 15px;
+          border-bottom: 2px solid #f7fafc;
+        }
+        
+        .card-header h2 {
+          font-size: 20px;
+          font-weight: 600;
+          color: var(--text-primary);
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+        
+        .card-header .icon {
+          width: 40px;
+          height: 40px;
+          border-radius: 10px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 18px;
+        }
+        
+        .card-header .server-icon {
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          color: white;
+        }
+        
+        .card-header .history-icon {
+          background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+          color: white;
+        }
+        
+        /* 表格样式 */
+        .stats-table-container {
+          overflow-x: auto;
+          border-radius: 10px;
+          background: white;
+          box-shadow: var(--shadow-sm);
+        }
+        
+        .stats-table {
+          width: 100%;
+          border-collapse: collapse;
+          min-width: 600px;
+        }
+        
+        .stats-table thead {
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        .stats-table th {
+          padding: 16px 20px;
+          text-align: left;
+          color: white;
+          font-weight: 600;
+          font-size: 14px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+        
+        .stats-table th:first-child {
+          border-top-left-radius: 10px;
+        }
+        
+        .stats-table th:last-child {
+          border-top-right-radius: 10px;
+        }
+        
+        .stats-table tbody tr {
+          border-bottom: 1px solid var(--border-color);
+          transition: background 0.2s ease;
+        }
+        
+        .stats-table tbody tr:hover {
+          background: #f8fafc;
+        }
+        
+        .stats-table tbody tr:last-child {
+          border-bottom: none;
+        }
+        
+        .stats-table td {
+          padding: 18px 20px;
+          color: var(--text-primary);
+        }
+        
+        /* 状态徽章 */
+        .status-badge {
+          padding: 6px 12px;
+          border-radius: 6px;
+          font-size: 12px;
+          font-weight: 600;
+          display: inline-block;
+          min-width: 60px;
+          text-align: center;
+        }
+        
+        .status-success {
+          background: linear-gradient(135deg, #c6f6d5 0%, #9ae6b4 100%);
+          color: #22543d;
+        }
+        
+        .status-failed {
+          background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
+          color: #742a2a;
+        }
+        
+        /* 进度条 */
+        .progress-container {
+          background: #e2e8f0;
+          border-radius: 10px;
+          height: 8px;
+          overflow: hidden;
+          margin-top: 8px;
+        }
+        
+        .progress-bar {
+          height: 100%;
+          background: linear-gradient(90deg, #4fd1c5 0%, #38b2ac 100%);
+          border-radius: 10px;
+          transition: width 0.5s ease;
+        }
+        
+        /* 加载状态 */
+        .loading-state {
+          text-align: center;
+          padding: 60px 20px;
+        }
+        
+        .loading-spinner {
+          width: 50px;
+          height: 50px;
+          border: 3px solid #e2e8f0;
+          border-top-color: #667eea;
+          border-radius: 50%;
+          margin: 0 auto 20px;
+          animation: spin 1s linear infinite;
+        }
+        
+        .empty-state {
+          text-align: center;
+          padding: 60px 20px;
+          color: var(--text-secondary);
+        }
+        
+        .empty-state i {
+          font-size: 48px;
+          margin-bottom: 20px;
+          color: #cbd5e0;
+        }
+        
+        .error-state {
+          text-align: center;
+          padding: 40px 20px;
+          background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
+          border-radius: 10px;
+          color: #742a2a;
+        }
+        
+        /* 响应式表格单元格 */
+        .mobile-row {
+          display: none;
+        }
+        
+        /* 调试信息 */
+        .debug-panel {
+          background: #1a202c;
+          color: #e2e8f0;
+          border-radius: 10px;
+          padding: 20px;
+          margin-top: 20px;
+          font-family: 'Monaco', 'Courier New', monospace;
+          font-size: 12px;
+          max-height: 300px;
+          overflow-y: auto;
+        }
+        
+        .debug-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 15px;
+        }
+        
+        .debug-header h4 {
+          color: #81e6d9;
+        }
+        
+        .debug-log {
+          padding: 8px 0;
+          border-bottom: 1px solid #2d3748;
+        }
+        
+        .debug-log:last-child {
+          border-bottom: none;
+        }
+        
+        /* 动画 */
+        @keyframes spin {
+          to { transform: rotate(360deg); }
+        }
+        
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(10px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .fade-in {
+          animation: fadeIn 0.5s ease-out;
+        }
+        
+        /* 移动端优化 */
+        @media (max-width: 768px) {
+          body {
+            padding: 15px;
+          }
           
           .header {
             padding: 20px;
+          }
+          
+          .header-content {
+            flex-direction: column;
+            align-items: stretch;
+          }
+          
+          .action-buttons {
+            justify-content: center;
+          }
+          
+          .btn {
+            padding: 10px 16px;
+            font-size: 13px;
+          }
+          
+          .stats-table {
+            min-width: auto;
+          }
+          
+          .stats-table thead {
+            display: none;
+          }
+          
+          .stats-table tbody tr {
+            display: block;
+            margin-bottom: 15px;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 15px;
+          }
+          
+          .stats-table td {
+            display: block;
+            padding: 8px 0;
+            border: none;
+          }
+          
+          .stats-table td:before {
+            content: attr(data-label);
+            font-weight: 600;
+            color: var(--text-secondary);
+            display: block;
+            margin-bottom: 4px;
+            font-size: 12px;
+            text-transform: uppercase;
+          }
+          
+          .mobile-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+          }
+        }
+        
+        /* 亮色/暗色主题切换支持 */
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --card-bg: rgba(45, 55, 72, 0.95);
+            --text-primary: #f7fafc;
+            --text-secondary: #a0aec0;
+            --border-color: #4a5568;
+          }
+          
+          body {
+            background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%);
+          }
+          
+          .card {
+            border: 1px solid rgba(255, 255, 255, 0.1);
+          }
+          
+          .stats-table-container {
+            background: #2d3748;
+          }
+          
+          .stats-table tbody tr:hover {
+            background: #4a5568;
+          }
+          
+          .progress-container {
+            background: #4a5568;
           }
         }
       </style>
     </head>
     <body>
       <div class="container">
-        <div class="header">
-          <h1><i class="fas fa-balance-scale"></i> 订阅转换负载均衡系统</h1>
-          <p class="subtitle">智能加权轮询 | 实时监控 | 性能统计</p>
-          <div class="actions">
-            <button class="btn btn-primary" onclick="refreshData()">
-              <i class="fas fa-sync-alt"></i> 刷新数据
-            </button>
-            <button class="btn btn-secondary" onclick="location.href='/init'">
-              <i class="fas fa-database"></i> 数据库管理
-            </button>
-            <button class="btn btn-secondary" onclick="toggleDebug()">
-              <i class="fas fa-bug"></i> 调试信息
-            </button>
+        <div class="header fade-in">
+          <div class="header-content">
+            <div class="title-section">
+              <h1>
+                <i class="fas fa-balance-scale"></i>
+                订阅转换负载均衡系统
+                <span class="badge">v1.0.0</span>
+              </h1>
+              <p>智能加权轮询 | 实时监控 | 性能统计</p>
+            </div>
+            <div class="action-buttons">
+              <button class="btn btn-primary" onclick="refreshData()">
+                <i class="fas fa-sync-alt"></i> 刷新数据
+              </button>
+              <button class="btn btn-secondary" onclick="location.href='/init'">
+                <i class="fas fa-cog"></i> 系统设置
+              </button>
+              <button class="btn btn-secondary" onclick="toggleDebug()">
+                <i class="fas fa-terminal"></i> 调试模式
+              </button>
+            </div>
           </div>
-          <div id="debug-info" class="debug-info" style="display: none;">
-            <h4><i class="fas fa-bug"></i> 调试信息</h4>
-            <div id="debug-content">加载中...</div>
+          
+          <div id="debug-panel" class="debug-panel" style="display: none;">
+            <div class="debug-header">
+              <h4><i class="fas fa-bug"></i> 系统调试信息</h4>
+              <button class="btn btn-secondary" onclick="clearDebugLogs()" style="padding: 4px 8px; font-size: 11px;">
+                清空日志
+              </button>
+            </div>
+            <div id="debug-content"></div>
           </div>
         </div>
         
         <div class="stats-grid">
-          <div class="card">
-            <h2><i class="fas fa-history"></i> 最近请求</h2>
-            <div id="recent-requests" class="loading">
-              <i class="fas fa-spinner"></i> 加载中...
+          <!-- 后端服务器状态卡片 -->
+          <div class="card fade-in" style="animation-delay: 0.1s;">
+            <div class="card-header">
+              <h2>
+                <span class="icon server-icon">
+                  <i class="fas fa-server"></i>
+                </span>
+                后端服务器状态
+              </h2>
+              <div class="stats-info">
+                <span style="color: var(--text-secondary); font-size: 14px;">
+                  总计: <span id="total-backends">${backendStats.length}</span> 个
+                </span>
+              </div>
+            </div>
+            <div id="backend-stats-container">
+              ${backendStats.length > 0 ? `
+                <div class="stats-table-container">
+                  <table class="stats-table">
+                    <thead>
+                      <tr>
+                        <th>后端地址</th>
+                        <th>请求统计</th>
+                        <th>性能指标</th>
+                        <th>权重状态</th>
+                      </tr>
+                    </thead>
+                    <tbody id="backend-stats-body">
+                      ${backendStats.map(backend => {
+                        const totalRequests = backend.total_requests || 0;
+                        const successCount = backend.success_count || 0;
+                        const successRate = totalRequests > 0 ? ((successCount / totalRequests) * 100).toFixed(1) : '0.0';
+                        const avgResponseTime = backend.average_response_time || 0;
+                        const dynamicWeight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
+                        
+                        return `
+                        <tr>
+                          <td data-label="后端地址">
+                            <div class="mobile-row">
+                              <strong>${backend.url || '未知'}</strong>
+                              ${backend.enabled === 0 ? '<span class="status-badge status-failed" style="margin-left: 8px;">已禁用</span>' : ''}
+                            </div>
+                            <div style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;">
+                              ${backend.url || '未知'}
+                            </div>
+                            ${backend.enabled === 0 ? '<div><span class="status-badge status-failed">已禁用</span></div>' : ''}
+                          </td>
+                          <td data-label="请求统计">
+                            <div style="margin-bottom: 4px;">
+                              <small>总请求: ${totalRequests}</small>
+                            </div>
+                            <div style="margin-bottom: 4px;">
+                              <small>成功: ${successCount} | 失败: ${backend.fail_count || 0}</small>
+                            </div>
+                            <div>
+                              <small>成功率: ${successRate}%</small>
+                            </div>
+                            <div class="progress-container">
+                              <div class="progress-bar" style="width: ${Math.min(successRate, 100)}%"></div>
+                            </div>
+                          </td>
+                          <td data-label="性能指标">
+                            <div style="margin-bottom: 4px;">
+                              <small>平均响应: ${formatResponseTimeForHTML(avgResponseTime)}</small>
+                            </div>
+                            <div>
+                              <small>最后响应: ${formatResponseTimeForHTML(backend.last_response_time || 0)}</small>
+                            </div>
+                          </td>
+                          <td data-label="权重状态">
+                            <div style="margin-bottom: 4px;">
+                              <small>基础权重: ${backend.weight || INITIAL_WEIGHT}</small>
+                            </div>
+                            <div style="margin-bottom: 4px;">
+                              <small>动态权重: ${dynamicWeight.toFixed(1)}</small>
+                            </div>
+                            <div>
+                              <small>最后使用: ${backend.last_used ? formatBeijingTimeForHTML(backend.last_used) : '从未'}</small>
+                            </div>
+                          </td>
+                        </tr>
+                        `;
+                      }).join('')}
+                    </tbody>
+                  </table>
+                </div>
+              ` : `
+                <div class="loading-state" id="backend-stats-loading">
+                  <div class="loading-spinner"></div>
+                  <p>正在加载后端服务器数据...</p>
+                </div>
+              `}
             </div>
           </div>
           
-          <div class="card">
-            <h2><i class="fas fa-server"></i> 后端服务器状态</h2>
-            <div id="backend-stats" class="loading">
-              <i class="fas fa-spinner"></i> 加载中...
+          <!-- 最近请求记录卡片 -->
+          <div class="card fade-in" style="animation-delay: 0.2s;">
+            <div class="card-header">
+              <h2>
+                <span class="icon history-icon">
+                  <i class="fas fa-history"></i>
+                </span>
+                最近请求记录
+              </h2>
+              <div class="stats-info">
+                <span style="color: var(--text-secondary); font-size: 14px;">
+                  最近20条记录
+                </span>
+              </div>
+            </div>
+            <div id="recent-requests-container">
+              ${recentRequests.length > 0 ? `
+                <div class="stats-table-container">
+                  <table class="stats-table">
+                    <thead>
+                      <tr>
+                        <th>后端地址</th>
+                        <th>状态</th>
+                        <th>响应时间</th>
+                        <th>请求时间</th>
+                      </tr>
+                    </thead>
+                    <tbody id="recent-requests-body">
+                      ${recentRequests.map(log => {
+                        const statusClass = log.status === 'success' ? 'status-success' : 'status-failed';
+                        const statusText = log.status === 'success' ? '成功' : '失败';
+                        
+                        return `
+                        <tr>
+                          <td data-label="后端地址">
+                            <div class="mobile-row">
+                              <span class="status-badge ${statusClass}">${statusText}</span>
+                            </div>
+                            <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
+                              ${log.backend_url || '未知'}
+                            </div>
+                          </td>
+                          <td data-label="状态">
+                            <span class="status-badge ${statusClass}">${statusText}</span>
+                            ${log.error_message ? `
+                              <div style="margin-top: 4px;">
+                                <small style="color: #718096; font-size: 11px;">
+                                  ${log.error_message.substring(0, 40)}${log.error_message.length > 40 ? '...' : ''}
+                                </small>
+                              </div>
+                            ` : ''}
+                          </td>
+                          <td data-label="响应时间">
+                            ${formatResponseTimeForHTML(log.response_time || 0)}
+                          </td>
+                          <td data-label="请求时间">
+                            ${formatBeijingTimeForHTML(log.request_time || new Date().toISOString())}
+                          </td>
+                        </tr>
+                        `;
+                      }).join('')}
+                    </tbody>
+                  </table>
+                </div>
+              ` : `
+                <div class="loading-state" id="recent-requests-loading">
+                  <div class="loading-spinner"></div>
+                  <p>正在加载请求记录...</p>
+                </div>
+              `}
+            </div>
+          </div>
+        </div>
+        
+        <!-- 系统信息卡片 -->
+        <div class="card fade-in" style="animation-delay: 0.3s; margin-top: 25px;">
+          <div class="card-header">
+            <h2>
+              <span class="icon" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white;">
+                <i class="fas fa-info-circle"></i>
+              </span>
+              系统信息
+            </h2>
+          </div>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">
+            <div class="info-item">
+              <h3 style="color: var(--text-secondary); font-size: 14px; margin-bottom: 8px;">权重算法</h3>
+              <p style="font-size: 16px; font-weight: 500;">
+                成功: +${SUCCESS_WEIGHT_INCREMENT}, 失败: -${FAILURE_WEIGHT_DECREMENT}
+              </p>
+              <p style="font-size: 13px; color: var(--text-secondary);">
+                范围: ${MIN_WEIGHT} - ${MAX_WEIGHT}
+              </p>
+            </div>
+            <div class="info-item">
+              <h3 style="color: var(--text-secondary); font-size: 14px; margin-bottom: 8px;">最近活动</h3>
+              <p style="font-size: 16px; font-weight: 500;" id="last-update-time">
+                正在更新...
+              </p>
+              <p style="font-size: 13px; color: var(--text-secondary);">
+                每30秒自动刷新
+              </p>
+            </div>
+            <div class="info-item">
+              <h3 style="color: var(--text-secondary); font-size: 14px; margin-bottom: 8px;">数据统计</h3>
+              <p style="font-size: 16px; font-weight: 500;">
+                保留最近 <strong>1000</strong> 条日志
+              </p>
+              <p style="font-size: 13px; color: var(--text-secondary);">
+                基于动态权重智能选择
+              </p>
             </div>
           </div>
         </div>
       </div>
       
       <script>
-        // 常量定义
-        const INITIAL_WEIGHT = ${INITIAL_WEIGHT};
-        const SUCCESS_WEIGHT_INCREMENT = ${SUCCESS_WEIGHT_INCREMENT};
-        const FAILURE_WEIGHT_DECREMENT = ${FAILURE_WEIGHT_DECREMENT};
-        const MAX_WEIGHT = ${MAX_WEIGHT};
-        const MIN_WEIGHT = ${MIN_WEIGHT};
-        
-        // 调试信息
-        let debugEnabled = false;
-        const debugLogs = [];
-        
-        function addDebugLog(message, data = null) {
-          const timestamp = new Date().toLocaleString('zh-CN');
-          const logEntry = {
-            timestamp,
-            message,
-            data
-          };
-          debugLogs.unshift(logEntry); // 添加到开头
-          if (debugLogs.length > 20) debugLogs.pop(); // 限制数量
-          
-          if (debugEnabled) {
-            updateDebugDisplay();
-          }
-        }
-        
-        function updateDebugDisplay() {
-          const debugContent = document.getElementById('debug-content');
-          if (!debugContent) return;
-          
-          let html = '';
-          debugLogs.forEach(log => {
-            html += \`<div style="margin-bottom: 5px; border-bottom: 1px dashed #ddd; padding-bottom: 5px;">
-              <strong>\${log.timestamp}</strong>: \${log.message}
-              \${log.data ? '<br><small style="color: #888;">' + JSON.stringify(log.data) + '</small>' : ''}
-            </div>\`;
-          });
-          debugContent.innerHTML = html;
-        }
-        
-        function toggleDebug() {
-          debugEnabled = !debugEnabled;
-          const debugInfo = document.getElementById('debug-info');
-          debugInfo.style.display = debugEnabled ? 'block' : 'none';
-          if (debugEnabled) {
-            updateDebugDisplay();
-          }
-        }
-        
-        // 格式化时间为北京时间
+        // 工具函数
         function formatBeijingTime(isoString) {
-          if (!isoString) return 'N/A';
+          if (!isoString) return '从未';
           try {
             const date = new Date(isoString);
-            // 转换为北京时间 (UTC+8)
-            const beijingTime = new Date(date.getTime());
-            return beijingTime.toLocaleString('zh-CN', { 
+            return date.toLocaleString('zh-CN', { 
               timeZone: 'Asia/Shanghai',
               year: 'numeric',
               month: '2-digit',
@@ -912,117 +1469,127 @@ async function handleStatusPage(request, env, isInitialized) {
               second: '2-digit'
             });
           } catch (e) {
-            addDebugLog('时间格式化错误', { isoString, error: e.message });
-            return isoString || 'N/A';
+            console.error('时间格式化错误:', e);
+            return isoString;
           }
         }
         
-        // 格式化响应时间
         function formatResponseTime(ms) {
-          if (ms === null || ms === undefined || isNaN(ms)) return '0ms';
+          if (!ms || ms < 0) return '0ms';
           if (ms < 1000) return ms.toFixed(0) + 'ms';
           return (ms / 1000).toFixed(2) + 's';
         }
         
-        // 加载最近请求数据
-        async function loadRecentRequests() {
-          addDebugLog('开始加载最近请求');
-          try {
-            const response = await fetch('/api/recent-requests');
-            addDebugLog('收到最近请求响应', { status: response.status });
-            
-            if (!response.ok) {
-              throw new Error(\`HTTP \${response.status}: \${response.statusText}\`);
-            }
-            
-            const data = await response.json();
-            addDebugLog('最近请求数据解析成功', { count: data.length });
-            
-            const container = document.getElementById('recent-requests');
-            if (!data || !Array.isArray(data) || data.length === 0) {
-              container.innerHTML = '<div class="empty-state">暂无请求记录</div>';
-              return;
-            }
-            
-            let html = \`
-              <table class="stats-table">
-                <thead>
-                  <tr>
-                    <th>后端地址</th>
-                    <th>状态</th>
-                    <th>响应时间</th>
-                    <th>时间</th>
-                  </tr>
-                </thead>
-                <tbody>
-            \`;
-            
-            data.forEach(item => {
-              html += \`
-                <tr>
-                  <td style="max-width: 200px; word-break: break-all;">
-                    <small>\${item.backend_url || 'N/A'}</small>
-                  </td>
-                  <td>
-                    <span class="status-badge \${(item.status || '') === 'success' ? 'status-success' : 'status-failed'}">
-                      \${(item.status || '') === 'success' ? '成功' : '失败'}
-                    </span>
-                    \${item.error_message ? '<br><small style="color: #666;">' + item.error_message.substring(0, 50) + (item.error_message.length > 50 ? '...' : '') + '</small>' : ''}
-                  </td>
-                  <td>\${formatResponseTime(item.response_time)}</td>
-                  <td>\${formatBeijingTime(item.request_time)}</td>
-                </tr>
-              \`;
-            });
-            
-            html += '</tbody></table>';
-            container.innerHTML = html;
-            
-          } catch (error) {
-            console.error('加载最近请求失败:', error);
-            addDebugLog('加载最近请求失败', { error: error.message });
-            document.getElementById('recent-requests').innerHTML = 
-              \`<div class="error-state">
-                <i class="fas fa-exclamation-triangle"></i> 加载失败<br>
-                <small>\${error.message}</small>
-                <button class="btn btn-primary" onclick="loadRecentRequests()" style="margin-top: 10px; font-size: 12px;">
-                  <i class="fas fa-redo"></i> 重试
-                </button>
-              </div>\`;
+        // 调试系统
+        let debugEnabled = localStorage.getItem('debugEnabled') === 'true';
+        let debugLogs = JSON.parse(localStorage.getItem('debugLogs') || '[]');
+        
+        function addDebugLog(message, data = null) {
+          const timestamp = new Date().toLocaleString('zh-CN');
+          const logEntry = {
+            timestamp,
+            message,
+            data: data ? JSON.stringify(data).substring(0, 200) : null
+          };
+          
+          debugLogs.unshift(logEntry);
+          if (debugLogs.length > 50) debugLogs.pop();
+          
+          localStorage.setItem('debugLogs', JSON.stringify(debugLogs));
+          
+          if (debugEnabled) {
+            updateDebugPanel();
           }
         }
         
-        // 加载后端统计
+        function updateDebugPanel() {
+          const debugContent = document.getElementById('debug-content');
+          if (!debugContent) return;
+          
+          let html = debugLogs.map(log => \`
+            <div class="debug-log">
+              <div style="color: #81e6d9; font-size: 11px;">\${log.timestamp}</div>
+              <div>\${log.message}</div>
+              \${log.data ? \`<div style="color: #a0aec0; font-size: 10px;">\${log.data}</div>\` : ''}
+            </div>
+          \`).join('');
+          
+          debugContent.innerHTML = html;
+        }
+        
+        function clearDebugLogs() {
+          debugLogs = [];
+          localStorage.setItem('debugLogs', JSON.stringify(debugLogs));
+          updateDebugPanel();
+        }
+        
+        function toggleDebug() {
+          debugEnabled = !debugEnabled;
+          localStorage.setItem('debugEnabled', debugEnabled);
+          
+          const debugPanel = document.getElementById('debug-panel');
+          debugPanel.style.display = debugEnabled ? 'block' : 'none';
+          
+          if (debugEnabled) {
+            updateDebugPanel();
+          }
+        }
+        
+        // 数据加载函数
         async function loadBackendStats() {
           addDebugLog('开始加载后端统计');
+          
+          const container = document.getElementById('backend-stats-container');
+          const loadingHTML = \`
+            <div class="loading-state">
+              <div class="loading-spinner"></div>
+              <p>正在加载后端服务器数据...</p>
+            </div>
+          \`;
+          
+          container.innerHTML = loadingHTML;
+          
           try {
-            const response = await fetch('/api/backend-stats');
-            addDebugLog('收到后端统计响应', { status: response.status });
+            const response = await fetch('/api/backend-stats?_t=' + Date.now());
+            addDebugLog('后端统计响应状态', { status: response.status });
             
             if (!response.ok) {
               throw new Error(\`HTTP \${response.status}: \${response.statusText}\`);
             }
             
             const data = await response.json();
-            addDebugLog('后端统计数据解析成功', { count: data.length });
+            addDebugLog('后端统计数据接收', { count: data.length });
             
-            const container = document.getElementById('backend-stats');
-            if (!data || !Array.isArray(data) || data.length === 0) {
-              container.innerHTML = '<div class="empty-state">暂无后端服务器<br><button class="btn btn-primary" onclick="location.href=\'/init\'" style="margin-top: 10px;">初始化数据库</button></div>';
+            if (!Array.isArray(data) || data.length === 0) {
+              container.innerHTML = \`
+                <div class="empty-state">
+                  <i class="fas fa-server"></i>
+                  <h3>暂无后端服务器</h3>
+                  <p>请前往系统设置初始化数据库</p>
+                  <button class="btn btn-primary" onclick="location.href='/init'" style="margin-top: 15px;">
+                    <i class="fas fa-cog"></i> 前往设置
+                  </button>
+                </div>
+              \`;
               return;
             }
             
+            // 更新总数显示
+            document.getElementById('total-backends').textContent = data.length;
+            
+            // 构建表格
             let html = \`
-              <table class="stats-table">
-                <thead>
-                  <tr>
-                    <th>后端地址</th>
-                    <th>统计</th>
-                    <th>响应时间</th>
-                    <th>权重</th>
-                  </tr>
-                </thead>
-                <tbody>
+              <div class="stats-table-container">
+                <table class="stats-table">
+                  <thead>
+                    <tr>
+                      <th>后端地址</th>
+                      <th>请求统计</th>
+                      <th>性能指标</th>
+                      <th>权重状态</th>
+                    </tr>
+                  </thead>
+                  <tbody>
             \`;
             
             data.forEach(backend => {
@@ -1031,89 +1598,238 @@ async function handleStatusPage(request, env, isInitialized) {
               const successRate = totalRequests > 0 
                 ? ((successCount / totalRequests) * 100).toFixed(1) 
                 : '0.0';
+              const avgResponseTime = backend.average_response_time || 0;
+              const dynamicWeight = backend.dynamic_weight || backend.weight || ${INITIAL_WEIGHT};
               
               html += \`
                 <tr>
-                  <td style="max-width: 150px; word-break: break-all;">
-                    <small>\${backend.url || 'N/A'}</small>
-                    \${backend.enabled === 0 ? '<br><small style="color: #dc3545;">已禁用</small>' : ''}
+                  <td data-label="后端地址">
+                    <div class="mobile-row">
+                      <strong>\${backend.url || '未知'}</strong>
+                      \${backend.enabled === 0 ? '<span class="status-badge status-failed" style="margin-left: 8px;">已禁用</span>' : ''}
+                    </div>
+                    <div style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;">
+                      \${backend.url || '未知'}
+                    </div>
+                    \${backend.enabled === 0 ? '<div><span class="status-badge status-failed">已禁用</span></div>' : ''}
                   </td>
-                  <td>
-                    <div>请求: \${totalRequests}</div>
-                    <div>成功: \${successCount} | 失败: \${backend.fail_count || 0}</div>
-                    <div>成功率: \${successRate}%</div>
-                    <div class="progress-bar">
-                      <div class="progress-fill" style="width: \${Math.min(successRate, 100)}%"></div>
+                  <td data-label="请求统计">
+                    <div style="margin-bottom: 4px;">
+                      <small>总请求: \${totalRequests}</small>
+                    </div>
+                    <div style="margin-bottom: 4px;">
+                      <small>成功: \${successCount} | 失败: \${backend.fail_count || 0}</small>
+                    </div>
+                    <div>
+                      <small>成功率: \${successRate}%</small>
+                    </div>
+                    <div class="progress-container">
+                      <div class="progress-bar" style="width: \${Math.min(successRate, 100)}%"></div>
                     </div>
                   </td>
-                  <td>
-                    <div>平均: \${formatResponseTime(backend.average_response_time)}</div>
-                    <small>最后: \${formatResponseTime(backend.last_response_time)}</small>
+                  <td data-label="性能指标">
+                    <div style="margin-bottom: 4px;">
+                      <small>平均响应: \${formatResponseTime(avgResponseTime)}</small>
+                    </div>
+                    <div>
+                      <small>最后响应: \${formatResponseTime(backend.last_response_time || 0)}</small>
+                    </div>
                   </td>
-                  <td>
-                    <div>基础权重: \${backend.weight || INITIAL_WEIGHT}</div>
-                    <div>动态权重: \${(backend.dynamic_weight || backend.weight || INITIAL_WEIGHT).toFixed(1)}</div>
-                    <div>最后使用: \${backend.last_used ? formatBeijingTime(backend.last_used) : '从未'}</div>
+                  <td data-label="权重状态">
+                    <div style="margin-bottom: 4px;">
+                      <small>基础权重: \${backend.weight || ${INITIAL_WEIGHT}}</small>
+                    </div>
+                    <div style="margin-bottom: 4px;">
+                      <small>动态权重: \${dynamicWeight.toFixed(1)}</small>
+                    </div>
+                    <div>
+                      <small>最后使用: \${backend.last_used ? formatBeijingTime(backend.last_used) : '从未'}</small>
+                    </div>
                   </td>
                 </tr>
               \`;
             });
             
-            html += '</tbody></table>';
+            html += '</tbody></table></div>';
             container.innerHTML = html;
+            addDebugLog('后端统计表格渲染完成');
             
           } catch (error) {
             console.error('加载后端统计失败:', error);
             addDebugLog('加载后端统计失败', { error: error.message });
-            document.getElementById('backend-stats').innerHTML = 
-              \`<div class="error-state">
-                <i class="fas fa-exclamation-triangle"></i> 加载失败<br>
-                <small>\${error.message}</small>
-                <button class="btn btn-primary" onclick="loadBackendStats()" style="margin-top: 10px; font-size: 12px;">
-                  <i class="fas fa-redo"></i> 重试
+            
+            container.innerHTML = \`
+              <div class="error-state">
+                <i class="fas fa-exclamation-triangle"></i>
+                <h3>加载失败</h3>
+                <p>\${error.message}</p>
+                <button class="btn btn-primary" onclick="loadBackendStats()" style="margin-top: 15px;">
+                  <i class="fas fa-redo"></i> 重新加载
                 </button>
-              </div>\`;
+              </div>
+            \`;
           }
         }
         
-        // 刷新数据
+        async function loadRecentRequests() {
+          addDebugLog('开始加载最近请求');
+          
+          const container = document.getElementById('recent-requests-container');
+          const loadingHTML = \`
+            <div class="loading-state">
+              <div class="loading-spinner"></div>
+              <p>正在加载请求记录...</p>
+            </div>
+          \`;
+          
+          container.innerHTML = loadingHTML;
+          
+          try {
+            const response = await fetch('/api/recent-requests?_t=' + Date.now());
+            addDebugLog('最近请求响应状态', { status: response.status });
+            
+            if (!response.ok) {
+              throw new Error(\`HTTP \${response.status}: \${response.statusText}\`);
+            }
+            
+            const data = await response.json();
+            addDebugLog('最近请求数据接收', { count: data.length });
+            
+            if (!Array.isArray(data) || data.length === 0) {
+              container.innerHTML = \`
+                <div class="empty-state">
+                  <i class="fas fa-history"></i>
+                  <h3>暂无请求记录</h3>
+                  <p>系统尚未处理任何请求</p>
+                </div>
+              \`;
+              return;
+            }
+            
+            // 构建表格
+            let html = \`
+              <div class="stats-table-container">
+                <table class="stats-table">
+                  <thead>
+                    <tr>
+                      <th>后端地址</th>
+                      <th>状态</th>
+                      <th>响应时间</th>
+                      <th>请求时间</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+            \`;
+            
+            data.forEach(log => {
+              const statusClass = log.status === 'success' ? 'status-success' : 'status-failed';
+              const statusText = log.status === 'success' ? '成功' : '失败';
+              
+              html += \`
+                <tr>
+                  <td data-label="后端地址">
+                    <div class="mobile-row">
+                      <span class="status-badge \${statusClass}">\${statusText}</span>
+                    </div>
+                    <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
+                      \${log.backend_url || '未知'}
+                    </div>
+                  </td>
+                  <td data-label="状态">
+                    <span class="status-badge \${statusClass}">\${statusText}</span>
+                    \${log.error_message ? \`
+                      <div style="margin-top: 4px;">
+                        <small style="color: #718096; font-size: 11px;">
+                          \${log.error_message.substring(0, 40)}\${log.error_message.length > 40 ? '...' : ''}
+                        </small>
+                      </div>
+                    \` : ''}
+                  </td>
+                  <td data-label="响应时间">
+                    \${formatResponseTime(log.response_time || 0)}
+                  </td>
+                  <td data-label="请求时间">
+                    \${formatBeijingTime(log.request_time || new Date().toISOString())}
+                  </td>
+                </tr>
+              \`;
+            });
+            
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+            addDebugLog('最近请求表格渲染完成');
+            
+          } catch (error) {
+            console.error('加载最近请求失败:', error);
+            addDebugLog('加载最近请求失败', { error: error.message });
+            
+            container.innerHTML = \`
+              <div class="error-state">
+                <i class="fas fa-exclamation-triangle"></i>
+                <h3>加载失败</h3>
+                <p>\${error.message}</p>
+                <button class="btn btn-primary" onclick="loadRecentRequests()" style="margin-top: 15px;">
+                  <i class="fas fa-redo"></i> 重新加载
+                </button>
+              </div>
+            \`;
+          }
+        }
+        
+        // 刷新所有数据
         function refreshData() {
           addDebugLog('手动刷新数据');
-          const loadingHTML = '<div class="loading"><i class="fas fa-spinner"></i> 加载中...</div>';
-          document.getElementById('recent-requests').innerHTML = loadingHTML;
-          document.getElementById('backend-stats').innerHTML = loadingHTML;
-          
-          loadRecentRequests();
+          document.getElementById('last-update-time').textContent = formatBeijingTime(new Date().toISOString());
           loadBackendStats();
+          loadRecentRequests();
         }
         
-        // 测试API连接
-        async function testAPIConnection() {
-          addDebugLog('测试API连接');
-          try {
-            const testUrls = ['/api/backend-stats', '/api/recent-requests'];
-            for (const url of testUrls) {
-              const response = await fetch(url);
-              addDebugLog(\`测试 \${url}\`, { status: response.status, ok: response.ok });
-            }
-          } catch (error) {
-            addDebugLog('API连接测试失败', { error: error.message });
-          }
-        }
-        
-        // 页面加载时获取数据
+        // 页面初始化
         document.addEventListener('DOMContentLoaded', () => {
           addDebugLog('页面加载完成');
-          loadRecentRequests();
-          loadBackendStats();
-          testAPIConnection();
+          
+          // 初始化调试面板
+          if (debugEnabled) {
+            document.getElementById('debug-panel').style.display = 'block';
+            updateDebugPanel();
+          }
+          
+          // 设置最后更新时间
+          document.getElementById('last-update-time').textContent = formatBeijingTime(new Date().toISOString());
+          
+          // 如果初始数据为空，则从API加载
+          if (${backendStats.length} === 0) {
+            loadBackendStats();
+          }
+          
+          if (${recentRequests.length} === 0) {
+            loadRecentRequests();
+          }
           
           // 每30秒自动刷新
           setInterval(refreshData, 30000);
           
-          // 检查是否有错误参数
-          const urlParams = new URLSearchParams(window.location.search);
-          if (urlParams.has('debug')) {
+          // 监听页面可见性变化
+          document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+              addDebugLog('页面变为可见，刷新数据');
+              refreshData();
+            }
+          });
+        });
+        
+        // 添加键盘快捷键
+        document.addEventListener('keydown', (e) => {
+          // Ctrl + R 刷新
+          if (e.ctrlKey && e.key === 'r') {
+            e.preventDefault();
+            refreshData();
+            addDebugLog('使用快捷键刷新数据');
+          }
+          
+          // Ctrl + D 切换调试
+          if (e.ctrlKey && e.key === 'd') {
+            e.preventDefault();
             toggleDebug();
           }
         });
@@ -1130,6 +1846,31 @@ async function handleStatusPage(request, env, isInitialized) {
   });
 }
 
+// 辅助函数：在HTML模板中使用的格式化函数
+function formatResponseTimeForHTML(ms) {
+  if (!ms || ms < 0) return '0ms';
+  if (ms < 1000) return ms.toFixed(0) + 'ms';
+  return (ms / 1000).toFixed(2) + 's';
+}
+
+function formatBeijingTimeForHTML(isoString) {
+  if (!isoString) return '从未';
+  try {
+    const date = new Date(isoString);
+    const beijingTime = new Date(date.getTime());
+    return beijingTime.toLocaleString('zh-CN', { 
+      timeZone: 'Asia/Shanghai',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  } catch (e) {
+    return isoString;
+  }
+}
+
 // 初始化页面
 async function handleInitPage(request, env) {
   logInfo('处理初始化页面请求');
@@ -1140,8 +1881,9 @@ async function handleInitPage(request, env) {
   // 检查是否有后端数据
   const result = await env.DB.prepare('SELECT COUNT(*) as count FROM backend_servers').first();
   const hasBackends = result && result.count > 0;
+  const backendCount = result?.count || 0;
   
-  logInfo(`初始化页面状态: 有后端数据 = ${hasBackends}, 数量 = ${result?.count || 0}`);
+  logInfo(`初始化页面状态: 有后端数据 = ${hasBackends}, 数量 = ${backendCount}`);
   
   const html = `
     <!DOCTYPE html>
@@ -1149,9 +1891,22 @@ async function handleInitPage(request, env) {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>数据库初始化</title>
+      <title>数据库初始化 - 订阅转换负载均衡</title>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
       <style>
+        :root {
+          --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+          --warning-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+          --card-bg: rgba(255, 255, 255, 0.95);
+          --text-primary: #2d3748;
+          --text-secondary: #718096;
+          --border-color: #e2e8f0;
+          --shadow-lg: 0 20px 40px rgba(0, 0, 0, 0.1);
+          --radius-lg: 20px;
+        }
+        
         * {
           margin: 0;
           padding: 0;
@@ -1159,88 +1914,260 @@ async function handleInitPage(request, env) {
         }
         
         body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+          background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
           min-height: 100vh;
           display: flex;
           align-items: center;
           justify-content: center;
           padding: 20px;
+          color: var(--text-primary);
+          line-height: 1.6;
         }
         
         .init-container {
-          background: white;
-          border-radius: 15px;
-          padding: 40px;
-          max-width: 600px;
+          background: var(--card-bg);
+          border-radius: var(--radius-lg);
+          padding: 50px;
+          max-width: 700px;
           width: 100%;
-          box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+          box-shadow: var(--shadow-lg);
+          backdrop-filter: blur(10px);
+          border: 1px solid rgba(255, 255, 255, 0.2);
           text-align: center;
+          animation: slideIn 0.6s ease-out;
         }
         
-        h1 {
-          color: #333;
-          margin-bottom: 20px;
+        @keyframes slideIn {
+          from {
+            opacity: 0;
+            transform: translateY(30px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        
+        .header {
+          margin-bottom: 40px;
+        }
+        
+        .header-icon {
+          width: 80px;
+          height: 80px;
+          background: var(--primary-gradient);
+          border-radius: 50%;
           display: flex;
           align-items: center;
           justify-content: center;
-          gap: 15px;
+          margin: 0 auto 20px;
+          color: white;
+          font-size: 32px;
+          box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
         }
         
-        h1 i {
-          color: #667eea;
-          font-size: 2em;
+        h1 {
+          font-size: 32px;
+          font-weight: 700;
+          background: var(--primary-gradient);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          margin-bottom: 12px;
+        }
+        
+        .subtitle {
+          color: var(--text-secondary);
+          font-size: 16px;
+          max-width: 500px;
+          margin: 0 auto;
         }
         
         .status-card {
-          background: #f8f9fa;
-          border-radius: 10px;
-          padding: 25px;
-          margin: 25px 0;
+          background: linear-gradient(135deg, #f8fafc 0%, #edf2f7 100%);
+          border-radius: 16px;
+          padding: 30px;
+          margin: 30px 0;
           text-align: left;
+          border: 1px solid var(--border-color);
         }
         
         .status-card h2 {
-          color: #495057;
-          margin-bottom: 15px;
+          color: var(--text-primary);
+          margin-bottom: 25px;
           display: flex;
           align-items: center;
-          gap: 10px;
-        }
-        
-        .status-item {
-          display: flex;
-          justify-content: space-between;
-          padding: 10px 0;
-          border-bottom: 1px solid #e9ecef;
-        }
-        
-        .status-item:last-child {
-          border-bottom: none;
-        }
-        
-        .status-label {
-          color: #666;
-          font-weight: 500;
-        }
-        
-        .status-value {
-          color: #333;
+          gap: 12px;
+          font-size: 20px;
           font-weight: 600;
         }
         
+        .status-card h2 i {
+          width: 36px;
+          height: 36px;
+          background: var(--primary-gradient);
+          border-radius: 10px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: white;
+          font-size: 16px;
+        }
+        
+        .status-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+          gap: 20px;
+        }
+        
+        .status-item {
+          padding: 20px;
+          background: white;
+          border-radius: 12px;
+          border: 1px solid var(--border-color);
+          transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .status-item:hover {
+          transform: translateY(-3px);
+          box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+        }
+        
+        .status-label {
+          color: var(--text-secondary);
+          font-size: 14px;
+          font-weight: 500;
+          margin-bottom: 8px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        
+        .status-value {
+          color: var(--text-primary);
+          font-size: 24px;
+          font-weight: 700;
+          margin-bottom: 4px;
+        }
+        
         .status-value.success {
-          color: #28a745;
+          color: #38a169;
+        }
+        
+        .status-value.warning {
+          color: #d69e2e;
         }
         
         .status-value.error {
-          color: #dc3545;
+          color: #e53e3e;
+        }
+        
+        .status-hint {
+          color: var(--text-secondary);
+          font-size: 13px;
+        }
+        
+        .backend-list {
+          background: white;
+          border-radius: 12px;
+          padding: 25px;
+          margin: 30px 0;
+          border: 1px solid var(--border-color);
+          max-height: 300px;
+          overflow-y: auto;
+        }
+        
+        .backend-list h3 {
+          color: var(--text-primary);
+          margin-bottom: 20px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          font-size: 18px;
+          font-weight: 600;
+        }
+        
+        .backend-list h3 i {
+          color: #667eea;
+        }
+        
+        .backend-url {
+          padding: 12px 15px;
+          background: #f7fafc;
+          border-radius: 8px;
+          margin-bottom: 10px;
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          transition: background 0.3s ease;
+        }
+        
+        .backend-url:hover {
+          background: #edf2f7;
+        }
+        
+        .backend-url i {
+          color: #667eea;
+          font-size: 14px;
+          min-width: 20px;
+        }
+        
+        .backend-url span {
+          color: var(--text-primary);
+          font-size: 14px;
+          word-break: break-all;
+        }
+        
+        .message {
+          padding: 20px;
+          border-radius: 12px;
+          margin: 25px 0;
+          display: none;
+          animation: fadeIn 0.5s ease;
+          text-align: left;
+        }
+        
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+        
+        .message.success {
+          background: linear-gradient(135deg, #c6f6d5 0%, #9ae6b4 100%);
+          color: #22543d;
+          border: 1px solid #9ae6b4;
+          display: block;
+        }
+        
+        .message.error {
+          background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
+          color: #742a2a;
+          border: 1px solid #feb2b2;
+          display: block;
+        }
+        
+        .message-content {
+          display: flex;
+          align-items: center;
+          gap: 15px;
+        }
+        
+        .message-icon {
+          font-size: 24px;
+          flex-shrink: 0;
+        }
+        
+        .btn-group {
+          display: flex;
+          flex-direction: column;
+          gap: 15px;
+          margin-top: 30px;
         }
         
         .btn {
-          padding: 15px 30px;
+          padding: 18px 30px;
           border: none;
-          border-radius: 8px;
+          border-radius: 12px;
           font-size: 16px;
           font-weight: 600;
           cursor: pointer;
@@ -1248,200 +2175,371 @@ async function handleInitPage(request, env) {
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          gap: 10px;
+          gap: 12px;
+          text-decoration: none;
           width: 100%;
-          margin-top: 20px;
         }
         
         .btn-primary {
-          background: #667eea;
+          background: var(--primary-gradient);
           color: white;
+          box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
         }
         
-        .btn-primary:hover {
-          background: #5a67d8;
-          transform: translateY(-2px);
-          box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+        .btn-primary:hover:not(:disabled) {
+          transform: translateY(-3px);
+          box-shadow: 0 8px 25px rgba(102, 126, 234, 0.5);
         }
         
         .btn-primary:disabled {
-          background: #6c757d;
+          opacity: 0.7;
           cursor: not-allowed;
-          transform: none;
-          box-shadow: none;
+          transform: none !important;
         }
         
         .btn-secondary {
-          background: #6c757d;
-          color: white;
+          background: white;
+          color: var(--text-primary);
+          border: 2px solid var(--border-color);
         }
         
         .btn-secondary:hover {
-          background: #5a6268;
-          transform: translateY(-2px);
-          box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+          background: #f7fafc;
+          transform: translateY(-3px);
+          box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
         }
         
-        .message {
-          padding: 15px;
-          border-radius: 8px;
-          margin: 20px 0;
-          display: none;
+        .btn-warning {
+          background: var(--warning-gradient);
+          color: white;
+          box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4);
         }
         
-        .message.success {
-          background: #d4edda;
-          color: #155724;
-          border: 1px solid #c3e6cb;
-          display: block;
+        .btn-warning:hover {
+          transform: translateY(-3px);
+          box-shadow: 0 8px 25px rgba(245, 87, 108, 0.5);
         }
         
-        .message.error {
-          background: #f8d7da;
-          color: #721c24;
-          border: 1px solid #f5c6cb;
-          display: block;
+        .spinner {
+          animation: spin 1s linear infinite;
         }
         
-        .default-backends {
-          background: #e9ecef;
-          border-radius: 8px;
-          padding: 15px;
-          margin: 20px 0;
-          text-align: left;
-          max-height: 200px;
-          overflow-y: auto;
-        }
-        
-        .default-backends h3 {
-          margin-bottom: 10px;
-          color: #495057;
-        }
-        
-        .backend-url {
-          padding: 5px 0;
-          color: #666;
-          font-size: 14px;
-          border-bottom: 1px dashed #dee2e6;
-        }
-        
-        .backend-url:last-child {
-          border-bottom: none;
+        @keyframes spin {
+          to { transform: rotate(360deg); }
         }
         
         @media (max-width: 768px) {
           .init-container {
-            padding: 20px;
+            padding: 30px 20px;
+          }
+          
+          h1 {
+            font-size: 26px;
+          }
+          
+          .header-icon {
+            width: 60px;
+            height: 60px;
+            font-size: 24px;
+          }
+          
+          .status-grid {
+            grid-template-columns: 1fr;
+          }
+          
+          .btn {
+            padding: 16px 20px;
+            font-size: 15px;
+          }
+        }
+        
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --card-bg: rgba(45, 55, 72, 0.95);
+            --text-primary: #f7fafc;
+            --text-secondary: #a0aec0;
+            --border-color: #4a5568;
+          }
+          
+          body {
+            background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%);
+          }
+          
+          .status-card {
+            background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
+          }
+          
+          .status-item {
+            background: #2d3748;
+          }
+          
+          .backend-list {
+            background: #2d3748;
+          }
+          
+          .backend-url {
+            background: #4a5568;
+          }
+          
+          .backend-url:hover {
+            background: #5a6778;
+          }
+          
+          .btn-secondary {
+            background: #4a5568;
+            color: #f7fafc;
+          }
+          
+          .btn-secondary:hover {
+            background: #5a6778;
           }
         }
       </style>
     </head>
     <body>
       <div class="init-container">
-        <h1><i class="fas fa-database"></i> 数据库初始化</h1>
+        <div class="header">
+          <div class="header-icon">
+            <i class="fas fa-database"></i>
+          </div>
+          <h1>数据库初始化</h1>
+          <p class="subtitle">订阅转换负载均衡系统的数据库配置与管理</p>
+        </div>
         
         <div class="status-card">
-          <h2><i class="fas fa-info-circle"></i> 当前状态</h2>
-          <div class="status-item">
-            <span class="status-label">数据库表:</span>
-            <span id="db-status" class="status-value success">
-              已创建
-            </span>
-          </div>
-          <div class="status-item">
-            <span class="status-label">后端服务器:</span>
-            <span id="backend-count" class="status-value ${hasBackends ? 'success' : 'error'}">
-              ${hasBackends ? `已配置 (${result.count}个)` : '未配置'}
-            </span>
+          <h2><i class="fas fa-info-circle"></i> 当前系统状态</h2>
+          <div class="status-grid">
+            <div class="status-item">
+              <div class="status-label">
+                <i class="fas fa-table"></i> 数据库表状态
+              </div>
+              <div class="status-value success">已就绪</div>
+              <div class="status-hint">后端表和日志表已创建</div>
+            </div>
+            
+            <div class="status-item">
+              <div class="status-label">
+                <i class="fas fa-server"></i> 后端服务器
+              </div>
+              <div class="status-value ${hasBackends ? 'success' : 'warning'}">
+                ${hasBackends ? `已配置 (${backendCount}个)` : '未配置'}
+              </div>
+              <div class="status-hint">
+                ${hasBackends ? '系统已准备就绪' : '需要初始化后端服务器'}
+              </div>
+            </div>
+            
+            <div class="status-item">
+              <div class="status-label">
+                <i class="fas fa-cogs"></i> 默认配置
+              </div>
+              <div class="status-value">${DEFAULT_BACKENDS.length} 个</div>
+              <div class="status-hint">预设后端服务器地址</div>
+            </div>
           </div>
         </div>
         
-        <div class="default-backends">
-          <h3><i class="fas fa-server"></i> 默认后端服务器 (${DEFAULT_BACKENDS.length}个)</h3>
-          ${DEFAULT_BACKENDS.map(url => `<div class="backend-url">${url}</div>`).join('')}
+        <div class="backend-list">
+          <h3><i class="fas fa-list"></i> 默认后端服务器列表</h3>
+          ${DEFAULT_BACKENDS.map(url => `
+            <div class="backend-url">
+              <i class="fas fa-link"></i>
+              <span>${url}</span>
+            </div>
+          `).join('')}
         </div>
         
         <div id="message" class="message"></div>
         
-        ${!hasBackends ? `
-          <button id="init-btn" class="btn btn-primary" onclick="initializeDatabase()">
-            <i class="fas fa-play-circle"></i> 初始化数据库（添加默认后端）
-          </button>
-        ` : `
-          <button class="btn btn-primary" onclick="location.href='/status'">
-            <i class="fas fa-chart-bar"></i> 前往状态页面
-          </button>
-          <button class="btn btn-secondary" onclick="resetDatabase()" style="margin-top: 10px;">
-            <i class="fas fa-redo"></i> 重置数据库
-          </button>
-        `}
+        <div class="btn-group">
+          ${!hasBackends ? `
+            <button id="init-btn" class="btn btn-primary" onclick="initializeDatabase()">
+              <i class="fas fa-play-circle"></i> 初始化数据库（添加默认后端）
+            </button>
+            <button class="btn btn-secondary" onclick="location.href='/status'">
+              <i class="fas fa-arrow-left"></i> 返回状态页面
+            </button>
+          ` : `
+            <button class="btn btn-primary" onclick="location.href='/status'">
+              <i class="fas fa-chart-bar"></i> 前往状态监控面板
+            </button>
+            <button class="btn btn-warning" onclick="showResetConfirm()">
+              <i class="fas fa-redo"></i> 重置数据库
+            </button>
+            <button class="btn btn-secondary" onclick="location.href='/'">
+              <i class="fas fa-home"></i> 返回首页
+            </button>
+          `}
+        </div>
       </div>
       
       <script>
-        function showMessage(text, type) {
+        function showMessage(text, type, icon = 'info-circle') {
           const messageDiv = document.getElementById('message');
           messageDiv.className = 'message ' + type;
-          messageDiv.innerHTML = text;
+          messageDiv.innerHTML = \`
+            <div class="message-content">
+              <div class="message-icon">
+                <i class="fas fa-\${icon}"></i>
+              </div>
+              <div>\${text}</div>
+            </div>
+          \`;
           messageDiv.style.display = 'block';
           
+          // 自动隐藏成功消息
           if (type === 'success') {
             setTimeout(() => {
-              location.href = '/status';
-            }, 2000);
+              messageDiv.style.display = 'none';
+            }, 5000);
           }
         }
         
         async function initializeDatabase() {
           const btn = document.getElementById('init-btn');
+          const originalHtml = btn.innerHTML;
+          
           btn.disabled = true;
-          btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 初始化中...';
+          btn.innerHTML = '<i class="fas fa-spinner spinner"></i> 正在初始化...';
           
           try {
+            showMessage('正在初始化数据库，请稍候...', 'success', 'spinner');
+            
             const response = await fetch('/api/init-db', {
-              method: 'POST'
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              }
             });
             
             const result = await response.json();
-            console.log('初始化结果:', result);
             
             if (result.success) {
-              showMessage('<i class="fas fa-check-circle"></i> 数据库初始化成功！添加了' + result.backends_added + '个后端。正在跳转...', 'success');
+              showMessage(
+                \`<strong>数据库初始化成功！</strong><br>
+                成功添加了 \${result.backends_added} 个后端服务器。\${result.errors.length > 0 ? ' (' + result.errors.length + '个失败)' : ''}<br>
+                页面将在 3 秒后自动跳转...\`,
+                'success',
+                'check-circle'
+              );
+              
+              setTimeout(() => {
+                location.href = '/status';
+              }, 3000);
             } else {
-              showMessage('<i class="fas fa-times-circle"></i> 初始化失败: ' + (result.error || '未知错误'), 'error');
+              showMessage(
+                \`<strong>初始化失败！</strong><br>
+                错误信息: \${result.error || '未知错误'}\`,
+                'error',
+                'times-circle'
+              );
               btn.disabled = false;
-              btn.innerHTML = '<i class="fas fa-play-circle"></i> 重新初始化';
+              btn.innerHTML = originalHtml;
             }
           } catch (error) {
-            showMessage('<i class="fas fa-times-circle"></i> 请求失败: ' + error.message, 'error');
+            showMessage(
+              \`<strong>请求失败！</strong><br>
+              网络错误: \${error.message}\`,
+              'error',
+              'times-circle'
+            );
             btn.disabled = false;
-            btn.innerHTML = '<i class="fas fa-play-circle"></i> 重新初始化';
+            btn.innerHTML = originalHtml;
+          }
+        }
+        
+        function showResetConfirm() {
+          const confirmHTML = \`
+            <div style="text-align: left; margin-bottom: 20px;">
+              <h3 style="margin-bottom: 10px; color: #e53e3e;">
+                <i class="fas fa-exclamation-triangle"></i> 确认重置数据库
+              </h3>
+              <p style="color: var(--text-secondary); line-height: 1.5;">
+                此操作将删除所有现有数据，包括：
+              </p>
+              <ul style="color: var(--text-secondary); margin: 10px 0 10px 20px;">
+                <li>所有后端服务器配置</li>
+                <li>所有请求历史记录</li>
+                <li>所有性能统计数据</li>
+              </ul>
+              <p style="color: var(--text-secondary);">
+                重置后系统将恢复到默认配置。
+              </p>
+            </div>
+          \`;
+          
+          if (confirm(confirmHTML.replace(/<[^>]*>/g, ''))) {
+            resetDatabase();
           }
         }
         
         async function resetDatabase() {
-          if (!confirm('确定要重置数据库吗？这将删除所有统计数据！')) {
-            return;
-          }
-          
           try {
+            showMessage('正在重置数据库，请稍候...', 'success', 'spinner');
+            
             const response = await fetch('/api/init-db', {
-              method: 'POST'
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              }
             });
             
             const result = await response.json();
             
             if (result.success) {
-              showMessage('<i class="fas fa-check-circle"></i> 数据库重置成功！添加了' + result.backends_added + '个后端。', 'success');
+              showMessage(
+                \`<strong>数据库重置成功！</strong><br>
+                已重新添加 \${result.backends_added} 个后端服务器。<br>
+                页面将在 2 秒后刷新...\`,
+                'success',
+                'check-circle'
+              );
+              
               setTimeout(() => {
                 location.reload();
-              }, 1500);
+              }, 2000);
             } else {
-              showMessage('<i class="fas fa-times-circle"></i> 重置失败: ' + (result.error || '未知错误'), 'error');
+              showMessage(
+                \`<strong>重置失败！</strong><br>
+                错误信息: \${result.error || '未知错误'}\`,
+                'error',
+                'times-circle'
+              );
             }
           } catch (error) {
-            showMessage('<i class="fas fa-times-circle"></i> 请求失败: ' + error.message, 'error');
+            showMessage(
+              \`<strong>请求失败！</strong><br>
+              网络错误: \${error.message}\`,
+              'error',
+              'times-circle'
+            );
           }
         }
+        
+        // 添加键盘快捷键
+        document.addEventListener('keydown', (e) => {
+          // Enter 键触发初始化（如果按钮可用）
+          if (e.key === 'Enter' && ${!hasBackends}) {
+            const initBtn = document.getElementById('init-btn');
+            if (initBtn && !initBtn.disabled) {
+              initializeDatabase();
+            }
+          }
+          
+          // Escape 键返回状态页面
+          if (e.key === 'Escape') {
+            location.href = '/status';
+          }
+        });
+        
+        // 页面加载完成动画
+        document.addEventListener('DOMContentLoaded', () => {
+          const statusItems = document.querySelectorAll('.status-item');
+          statusItems.forEach((item, index) => {
+            item.style.animationDelay = \`\${index * 0.1}s\`;
+            item.style.animation = 'slideIn 0.5s ease-out forwards';
+          });
+        });
       </script>
     </body>
     </html>
@@ -1449,7 +2547,8 @@ async function handleInitPage(request, env) {
   
   return new Response(html, {
     headers: {
-      'Content-Type': 'text/html; charset=utf-8'
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
     }
   });
 }
@@ -1523,85 +2622,6 @@ async function handleInitDatabase(request, env) {
       headers: {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
-}
-
-// API: 获取后端统计
-async function handleBackendStats(request, env) {
-  logDebug('开始获取后端统计');
-  try {
-    const result = await env.DB.prepare(`
-      SELECT 
-        id, url, weight, dynamic_weight,
-        total_requests, success_count, fail_count,
-        average_response_time, last_response_time,
-        last_used, enabled
-      FROM backend_servers
-      ORDER BY dynamic_weight DESC
-    `).all();
-    
-    logDebug(`获取后端统计成功: 找到${result.results?.length || 0}条记录`);
-    logDebug('后端统计详细数据:', result.results);
-    
-    return new Response(JSON.stringify(result.results || []), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store'
-      }
-    });
-    
-  } catch (error) {
-    logError('获取后端统计时发生错误', error);
-    return new Response(JSON.stringify({
-      error: error.message,
-      stack: error.stack
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store'
-      }
-    });
-  }
-}
-
-// API: 获取最近请求
-async function handleRecentRequests(request, env) {
-  logDebug('开始获取最近请求');
-  try {
-    const result = await env.DB.prepare(`
-      SELECT 
-        backend_url, response_time, status, error_message, request_time
-      FROM request_logs
-      ORDER BY request_time DESC
-      LIMIT 20
-    `).all();
-    
-    logDebug(`获取最近请求成功: 找到${result.results?.length || 0}条记录`);
-    
-    return new Response(JSON.stringify(result.results || []), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store'
-      }
-    });
-    
-  } catch (error) {
-    logError('获取最近请求时发生错误', error);
-    return new Response(JSON.stringify({
-      error: error.message,
-      stack: error.stack
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store'
       }
     });
   }
