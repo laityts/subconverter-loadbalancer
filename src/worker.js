@@ -5,11 +5,11 @@
 const BEIJING_TIMEZONE = 'Asia/Shanghai';
 
 // 默认后端地址
+// https://sub.xeton.dev
+// https://api.wcc.best
 const DEFAULT_BACKENDS = [
-  'https://api.wcc.best',
   'https://www.nameless13.com',
   'https://subapi.cmliussss.net',
-  'https://sub.xeton.dev',
   'https://subapi.sosoorg.com',
   'https://url.v1.mk'
 ];
@@ -1172,6 +1172,45 @@ async function handleStatusPage(request, env, isInitialized) {
             align-items: center;
             margin-bottom: 10px;
           }
+          
+          /* 修改：移动端后端地址只显示mobile-row，隐藏桌面端div */
+          #backend-stats-container .stats-table td:first-child > div:not(.mobile-row) {
+            display: none !important;
+          }
+          
+          #backend-stats-container .stats-table td:first-child .mobile-row {
+            display: block;
+            margin-bottom: 0;
+          }
+          
+          #backend-stats-container .stats-table td:first-child .mobile-row strong {
+            display: block;
+            word-break: break-all;
+            font-size: 14px;
+            color: var(--text-primary);
+          }
+          
+          /* 修改：移动端最近请求记录后端地址移除状态徽章 */
+          #recent-requests-container .stats-table td:first-child .mobile-row .status-badge {
+            display: none !important;
+          }
+          
+          #recent-requests-container .stats-table td:first-child > div:not(.mobile-row) {
+            display: none !important;
+          }
+          
+          #recent-requests-container .stats-table td:first-child .mobile-row {
+            display: block;
+            margin-bottom: 0;
+            justify-content: flex-start;
+          }
+          
+          #recent-requests-container .stats-table td:first-child .mobile-row span:not(.status-badge) {
+            display: block;
+            word-break: break-all;
+            font-size: 14px;
+            color: var(--text-primary);
+          }
         }
         
         /* 亮色/暗色主题切换支持 */
@@ -1373,7 +1412,7 @@ async function handleStatusPage(request, env, isInitialized) {
                         <tr>
                           <td data-label="后端地址">
                             <div class="mobile-row">
-                              <span class="status-badge ${statusClass}">${statusText}</span>
+                              ${log.backend_url || '未知'}
                             </div>
                             <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
                               ${log.backend_url || '未知'}
@@ -1437,7 +1476,7 @@ async function handleStatusPage(request, env, isInitialized) {
                 正在更新...
               </p>
               <p style="font-size: 13px; color: var(--text-secondary);">
-                每30秒自动刷新
+                每120秒自动刷新
               </p>
             </div>
             <div class="info-item">
@@ -1729,7 +1768,7 @@ async function handleStatusPage(request, env, isInitialized) {
                 <tr>
                   <td data-label="后端地址">
                     <div class="mobile-row">
-                      <span class="status-badge \${statusClass}">\${statusText}</span>
+                      \${log.backend_url || '未知'}
                     </div>
                     <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
                       \${log.backend_url || '未知'}
@@ -1806,8 +1845,8 @@ async function handleStatusPage(request, env, isInitialized) {
             loadRecentRequests();
           }
           
-          // 每30秒自动刷新
-          setInterval(refreshData, 30000);
+          // 每120秒自动刷新（修改为120秒）
+          setInterval(refreshData, 120000);
           
           // 监听页面可见性变化
           document.addEventListener('visibilitychange', () => {
