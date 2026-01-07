@@ -21,54 +21,102 @@ const FAILURE_WEIGHT_DECREMENT = 2; // 失败时权重减少
 const MAX_WEIGHT = 20; // 最大权重
 const MIN_WEIGHT = 1;  // 最小权重
 
+// 调试日志函数
+function logDebug(message, data = null) {
+  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const logMessage = `[DEBUG][${timestamp}] ${message}`;
+  if (data) {
+    console.log(logMessage, JSON.stringify(data, null, 2));
+  } else {
+    console.log(logMessage);
+  }
+}
+
+// 错误日志函数
+function logError(message, error = null) {
+  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const errorMessage = `[ERROR][${timestamp}] ${message}`;
+  if (error) {
+    console.error(errorMessage, error.stack || error.message || error);
+  } else {
+    console.error(errorMessage);
+  }
+}
+
+// 信息日志函数
+function logInfo(message, data = null) {
+  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const infoMessage = `[INFO][${timestamp}] ${message}`;
+  if (data) {
+    console.log(infoMessage, JSON.stringify(data, null, 2));
+  } else {
+    console.log(infoMessage);
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathname = url.pathname;
     
+    logInfo(`收到请求: ${request.method} ${url.pathname}${url.search}`);
+    logDebug('请求头信息:', Object.fromEntries(request.headers.entries()));
+    
     // 处理 OPTIONS 预检请求（CORS）
     if (request.method === 'OPTIONS') {
+      logInfo('处理 OPTIONS 预检请求');
       return handleOptions(request);
     }
     
     // 首先确保数据库已初始化
     try {
       await ensureDatabaseInitialized(env);
+      logInfo('数据库初始化检查完成');
     } catch (error) {
-      console.error('Database initialization failed:', error);
+      logError('数据库初始化失败', error);
       // 如果是状态页面，仍然返回HTML让用户能看到初始化按钮
       if (pathname === '/status') {
+        logInfo('数据库未初始化，返回状态页面');
         return handleStatusPage(request, env, false);
       }
       // 如果是初始化页面，允许访问
       if (pathname === '/init' || pathname === '/api/init-db') {
+        logInfo('访问初始化相关页面，继续处理');
         // 继续处理
       } else {
         // 其他页面重定向到初始化页面
+        logInfo(`数据库未初始化，重定向到初始化页面: ${url.origin}/init`);
         return Response.redirect(`${url.origin}/init`, 302);
       }
     }
     
     // 路由处理
     if (pathname === '/sub' || pathname.startsWith('/sub/')) {
+      logInfo('处理订阅转换请求');
       return handleSubscriptionRequest(request, env);
     } else if (pathname === '/version') {
+      logInfo('处理版本请求');
       return handleVersionRequest(request, env);
     } else if (pathname === '/status') {
+      logInfo('处理状态页面请求');
       return handleStatusPage(request, env, true);
     } else if (pathname === '/init') {
+      logInfo('处理初始化页面请求');
       return handleInitPage(request, env);
     } else if (pathname === '/api/init-db') {
+      logInfo('处理数据库初始化API请求');
       return handleInitDatabase(request, env);
     } else if (pathname === '/api/backend-stats') {
+      logInfo('处理后端统计API请求');
       return handleBackendStats(request, env);
     } else if (pathname === '/api/recent-requests') {
+      logInfo('处理最近请求API请求');
       return handleRecentRequests(request, env);
     } else if (pathname === '/') {
-      // 根路径重定向到状态页面
+      logInfo('根路径重定向到状态页面');
       return Response.redirect(`${url.origin}/status`, 302);
     } else {
-      // 其他路径转发到订阅转换
+      logInfo(`其他路径转发到订阅转换: ${pathname}`);
       return handleSubscriptionRequest(request, env);
     }
   }
@@ -89,6 +137,7 @@ function handleOptions(request) {
 
 // 确保数据库已初始化
 async function ensureDatabaseInitialized(env) {
+  logDebug('开始检查数据库初始化状态');
   try {
     // 检查表是否存在
     const tables = await env.DB.prepare(`
@@ -96,13 +145,19 @@ async function ensureDatabaseInitialized(env) {
       WHERE type='table' AND name IN ('backend_servers', 'request_logs')
     `).all();
     
+    logDebug('数据库表检查结果:', tables);
+    
     // 如果表不存在，创建它们
     if (!tables.results || tables.results.length < 2) {
+      logInfo('数据库表不存在，开始创建表');
       await createDatabaseTables(env);
+      logInfo('数据库表创建完成');
+    } else {
+      logDebug('数据库表已存在');
     }
     return true;
   } catch (error) {
-    console.error('Error ensuring database is initialized:', error);
+    logError('检查数据库初始化状态失败', error);
     throw error;
   }
 }
@@ -110,6 +165,8 @@ async function ensureDatabaseInitialized(env) {
 // 创建数据库表
 async function createDatabaseTables(env) {
   try {
+    logDebug('开始创建数据库表');
+    
     // 创建后端服务器表
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS backend_servers (
@@ -129,6 +186,8 @@ async function createDatabaseTables(env) {
       )
     `).run();
     
+    logDebug('后端服务器表创建成功');
+    
     // 创建请求日志表
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS request_logs (
@@ -142,6 +201,8 @@ async function createDatabaseTables(env) {
       )
     `).run();
     
+    logDebug('请求日志表创建成功');
+    
     // 创建索引
     await env.DB.prepare(`
       CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(request_time DESC)
@@ -151,26 +212,38 @@ async function createDatabaseTables(env) {
       CREATE INDEX IF NOT EXISTS idx_backend_servers_weight ON backend_servers(dynamic_weight DESC)
     `).run();
     
-    console.log('Database tables created successfully');
+    logDebug('数据库索引创建成功');
+    logInfo('数据库表创建完成');
     return true;
   } catch (error) {
-    console.error('Error creating database tables:', error);
+    logError('创建数据库表失败', error);
     throw error;
   }
 }
 
 // 处理订阅转换请求
 async function handleSubscriptionRequest(request, env) {
+  logDebug('开始处理订阅转换请求');
   try {
     // 获取后端列表并智能选择
     const backend = await selectBackend(env);
+    logDebug('选择的后端:', backend);
+    
     if (!backend) {
-      return new Response('No available backend servers', { status: 503 });
+      logError('没有可用的后端服务器');
+      return new Response('No available backend servers', { 
+        status: 503,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'text/plain; charset=utf-8'
+        }
+      });
     }
     
     // 构建转发URL
     const originalUrl = new URL(request.url);
     const backendUrl = `${backend.url}${originalUrl.pathname}${originalUrl.search}`;
+    logInfo(`转发请求到后端: ${backendUrl}`);
     
     // 记录开始时间
     const startTime = Date.now();
@@ -190,13 +263,18 @@ async function handleSubscriptionRequest(request, env) {
     
     try {
       // 转发请求
+      logDebug('开始转发请求到后端');
       response = await fetch(forwardRequest);
       responseTime = Date.now() - startTime;
+      logInfo(`后端响应时间: ${responseTime}ms, 状态码: ${response.status}`);
       
       // 检查响应状态
       if (!response.ok) {
         status = 'failed';
         errorMsg = `HTTP ${response.status}: ${response.statusText}`;
+        logError(`后端响应失败: ${errorMsg}`);
+      } else {
+        logInfo('后端响应成功');
       }
       
       // 更新后端统计信息
@@ -218,6 +296,7 @@ async function handleSubscriptionRequest(request, env) {
       headers.set('Pragma', 'no-cache');
       headers.set('Expires', '0');
       
+      logInfo('请求处理完成，返回响应');
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -228,6 +307,7 @@ async function handleSubscriptionRequest(request, env) {
       responseTime = Date.now() - startTime;
       status = 'failed';
       errorMsg = error.message;
+      logError('请求后端时发生错误', error);
       
       // 更新后端统计信息（失败）
       await updateBackendStats(env, backend.id, false, responseTime);
@@ -245,17 +325,18 @@ async function handleSubscriptionRequest(request, env) {
         status: 502,
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Content-Type': 'text/plain'
+          'Content-Type': 'text/plain; charset=utf-8'
         }
       });
     }
     
   } catch (error) {
+    logError('处理订阅请求时发生内部错误', error);
     return new Response(`Internal error: ${error.message}`, {
       status: 500,
       headers: {
         'Access-Control-Allow-Origin': '*',
-        'Content-Type': 'text/plain'
+        'Content-Type': 'text/plain; charset=utf-8'
       }
     });
   }
@@ -263,12 +344,16 @@ async function handleSubscriptionRequest(request, env) {
 
 // 处理版本请求
 async function handleVersionRequest(request, env) {
+  logDebug('开始处理版本请求');
   try {
     // 选择后端
     const backend = await selectBackend(env);
     if (!backend) {
+      logError('没有可用的后端服务器用于版本检查');
       return new Response('No available backend servers', { status: 503 });
     }
+    
+    logInfo(`检查后端版本: ${backend.url}`);
     
     // 获取版本信息
     const versionUrl = `${backend.url}/version`;
@@ -279,12 +364,14 @@ async function handleVersionRequest(request, env) {
     });
     
     if (!response.ok) {
+      logError(`后端版本检查失败: ${response.status}`);
       return new Response(`Backend version check failed: ${response.status}`, {
         status: response.status
       });
     }
     
     const versionText = await response.text();
+    logInfo(`后端版本: ${versionText.substring(0, 100)}...`);
     
     return new Response(versionText, {
       headers: {
@@ -294,11 +381,12 @@ async function handleVersionRequest(request, env) {
     });
     
   } catch (error) {
+    logError('版本检查错误', error);
     return new Response(`Version check error: ${error.message}`, {
       status: 500,
       headers: {
         'Access-Control-Allow-Origin': '*',
-        'Content-Type': 'text/plain'
+        'Content-Type': 'text/plain; charset=utf-8'
       }
     });
   }
@@ -306,6 +394,7 @@ async function handleVersionRequest(request, env) {
 
 // 智能选择后端（加权轮询）
 async function selectBackend(env) {
+  logDebug('开始选择后端');
   try {
     // 从数据库获取所有启用的后端
     const result = await env.DB.prepare(`
@@ -316,11 +405,15 @@ async function selectBackend(env) {
       ORDER BY dynamic_weight DESC, average_response_time ASC
     `).all();
     
+    logDebug('数据库查询结果:', result);
+    
     if (!result.results || result.results.length === 0) {
+      logError('数据库中没有启用的后端服务器');
       return null;
     }
     
     const backends = result.results;
+    logInfo(`找到 ${backends.length} 个启用的后端服务器`);
     
     // 计算总权重
     let totalWeight = 0;
@@ -330,10 +423,13 @@ async function selectBackend(env) {
     
     // 如果没有配置动态权重，使用基础权重
     if (totalWeight === 0) {
+      logDebug('动态权重为0，使用基础权重');
       for (const backend of backends) {
         totalWeight += backend.weight || INITIAL_WEIGHT;
       }
     }
+    
+    logDebug(`总权重: ${totalWeight}`);
     
     // 随机选择一个（基于权重）
     let random = Math.random() * totalWeight;
@@ -350,19 +446,22 @@ async function selectBackend(env) {
     
     // 如果随机选择失败，选择第一个
     if (!selectedBackend) {
+      logDebug('随机选择失败，选择第一个后端');
       selectedBackend = backends[0];
     }
     
+    logInfo(`选择了后端: ${selectedBackend.url}, 权重: ${selectedBackend.dynamic_weight || selectedBackend.weight}`);
     return selectedBackend;
     
   } catch (error) {
-    console.error('Error selecting backend:', error);
+    logError('选择后端时发生错误', error);
     return null;
   }
 }
 
 // 更新后端统计信息
 async function updateBackendStats(env, backendId, success, responseTime) {
+  logDebug(`更新后端统计: id=${backendId}, success=${success}, responseTime=${responseTime}ms`);
   try {
     // 获取当前统计信息
     const result = await env.DB.prepare(`
@@ -371,7 +470,12 @@ async function updateBackendStats(env, backendId, success, responseTime) {
       WHERE id = ?
     `).bind(backendId).first();
     
-    if (!result) return;
+    if (!result) {
+      logError(`找不到后端ID: ${backendId}`);
+      return;
+    }
+    
+    logDebug('当前后端统计:', result);
     
     // 计算新的统计数据
     const totalRequests = result.total_requests + 1;
@@ -390,8 +494,10 @@ async function updateBackendStats(env, backendId, success, responseTime) {
     let dynamicWeight = result.dynamic_weight || result.weight || INITIAL_WEIGHT;
     if (success) {
       dynamicWeight = Math.min(dynamicWeight + SUCCESS_WEIGHT_INCREMENT, MAX_WEIGHT);
+      logDebug(`请求成功，权重增加: ${dynamicWeight}`);
     } else {
       dynamicWeight = Math.max(dynamicWeight - FAILURE_WEIGHT_DECREMENT, MIN_WEIGHT);
+      logDebug(`请求失败，权重减少: ${dynamicWeight}`);
     }
     
     // 更新数据库
@@ -415,13 +521,16 @@ async function updateBackendStats(env, backendId, success, responseTime) {
       backendId
     ).run();
     
+    logInfo(`后端统计更新完成: id=${backendId}, 总请求=${totalRequests}, 成功=${successCount}, 失败=${failCount}, 平均响应=${avgResponseTime.toFixed(2)}ms, 动态权重=${dynamicWeight}`);
+    
   } catch (error) {
-    console.error('Error updating backend stats:', error);
+    logError('更新后端统计时发生错误', error);
   }
 }
 
 // 记录请求日志
 async function logRequest(env, data) {
+  logDebug('记录请求日志:', data);
   try {
     await env.DB.prepare(`
       INSERT INTO request_logs (backend_url, response_time, status, error_message, request_time)
@@ -434,6 +543,8 @@ async function logRequest(env, data) {
       data.request_time
     ).run();
     
+    logDebug('请求日志插入成功');
+    
     // 清理旧的日志（保留最近1000条）
     await env.DB.prepare(`
       DELETE FROM request_logs 
@@ -444,13 +555,17 @@ async function logRequest(env, data) {
       )
     `).run();
     
+    logDebug('清理旧日志完成');
+    
   } catch (error) {
-    console.error('Error logging request:', error);
+    logError('记录请求日志时发生错误', error);
   }
 }
 
 // 状态页面
 async function handleStatusPage(request, env, isInitialized) {
+  logInfo('处理状态页面请求');
+  
   // 首先确保数据库已初始化
   if (!isInitialized) {
     try {
@@ -458,6 +573,7 @@ async function handleStatusPage(request, env, isInitialized) {
       isInitialized = true;
     } catch (error) {
       // 如果初始化失败，跳转到初始化页面
+      logError('状态页面: 数据库初始化失败', error);
       return Response.redirect(`${new URL(request.url).origin}/init`, 302);
     }
   }
@@ -654,6 +770,26 @@ async function handleStatusPage(request, env, isInitialized) {
           color: #666;
         }
         
+        .error-state {
+          text-align: center;
+          padding: 40px;
+          color: #dc3545;
+          background: #f8d7da;
+          border-radius: 8px;
+          margin: 10px 0;
+        }
+        
+        .debug-info {
+          background: #f8f9fa;
+          border-radius: 8px;
+          padding: 15px;
+          margin-top: 20px;
+          font-size: 12px;
+          color: #666;
+          max-height: 200px;
+          overflow-y: auto;
+        }
+        
         @keyframes spin {
           from { transform: rotate(0deg); }
           to { transform: rotate(360deg); }
@@ -682,6 +818,13 @@ async function handleStatusPage(request, env, isInitialized) {
             <button class="btn btn-secondary" onclick="location.href='/init'">
               <i class="fas fa-database"></i> 数据库管理
             </button>
+            <button class="btn btn-secondary" onclick="toggleDebug()">
+              <i class="fas fa-bug"></i> 调试信息
+            </button>
+          </div>
+          <div id="debug-info" class="debug-info" style="display: none;">
+            <h4><i class="fas fa-bug"></i> 调试信息</h4>
+            <div id="debug-content">加载中...</div>
           </div>
         </div>
         
@@ -703,6 +846,55 @@ async function handleStatusPage(request, env, isInitialized) {
       </div>
       
       <script>
+        // 常量定义
+        const INITIAL_WEIGHT = ${INITIAL_WEIGHT};
+        const SUCCESS_WEIGHT_INCREMENT = ${SUCCESS_WEIGHT_INCREMENT};
+        const FAILURE_WEIGHT_DECREMENT = ${FAILURE_WEIGHT_DECREMENT};
+        const MAX_WEIGHT = ${MAX_WEIGHT};
+        const MIN_WEIGHT = ${MIN_WEIGHT};
+        
+        // 调试信息
+        let debugEnabled = false;
+        const debugLogs = [];
+        
+        function addDebugLog(message, data = null) {
+          const timestamp = new Date().toLocaleString('zh-CN');
+          const logEntry = {
+            timestamp,
+            message,
+            data
+          };
+          debugLogs.unshift(logEntry); // 添加到开头
+          if (debugLogs.length > 20) debugLogs.pop(); // 限制数量
+          
+          if (debugEnabled) {
+            updateDebugDisplay();
+          }
+        }
+        
+        function updateDebugDisplay() {
+          const debugContent = document.getElementById('debug-content');
+          if (!debugContent) return;
+          
+          let html = '';
+          debugLogs.forEach(log => {
+            html += \`<div style="margin-bottom: 5px; border-bottom: 1px dashed #ddd; padding-bottom: 5px;">
+              <strong>\${log.timestamp}</strong>: \${log.message}
+              \${log.data ? '<br><small style="color: #888;">' + JSON.stringify(log.data) + '</small>' : ''}
+            </div>\`;
+          });
+          debugContent.innerHTML = html;
+        }
+        
+        function toggleDebug() {
+          debugEnabled = !debugEnabled;
+          const debugInfo = document.getElementById('debug-info');
+          debugInfo.style.display = debugEnabled ? 'block' : 'none';
+          if (debugEnabled) {
+            updateDebugDisplay();
+          }
+        }
+        
         // 格式化时间为北京时间
         function formatBeijingTime(isoString) {
           if (!isoString) return 'N/A';
@@ -720,22 +912,31 @@ async function handleStatusPage(request, env, isInitialized) {
               second: '2-digit'
             });
           } catch (e) {
+            addDebugLog('时间格式化错误', { isoString, error: e.message });
             return isoString || 'N/A';
           }
         }
         
         // 格式化响应时间
         function formatResponseTime(ms) {
-          if (ms === null || ms === undefined) return '0ms';
+          if (ms === null || ms === undefined || isNaN(ms)) return '0ms';
           if (ms < 1000) return ms.toFixed(0) + 'ms';
           return (ms / 1000).toFixed(2) + 's';
         }
         
         // 加载最近请求数据
         async function loadRecentRequests() {
+          addDebugLog('开始加载最近请求');
           try {
             const response = await fetch('/api/recent-requests');
+            addDebugLog('收到最近请求响应', { status: response.status });
+            
+            if (!response.ok) {
+              throw new Error(\`HTTP \${response.status}: \${response.statusText}\`);
+            }
+            
             const data = await response.json();
+            addDebugLog('最近请求数据解析成功', { count: data.length });
             
             const container = document.getElementById('recent-requests');
             if (!data || !Array.isArray(data) || data.length === 0) {
@@ -766,7 +967,7 @@ async function handleStatusPage(request, env, isInitialized) {
                     <span class="status-badge \${(item.status || '') === 'success' ? 'status-success' : 'status-failed'}">
                       \${(item.status || '') === 'success' ? '成功' : '失败'}
                     </span>
-                    \${item.error_message ? '<br><small style="color: #666;">' + item.error_message + '</small>' : ''}
+                    \${item.error_message ? '<br><small style="color: #666;">' + item.error_message.substring(0, 50) + (item.error_message.length > 50 ? '...' : '') + '</small>' : ''}
                   </td>
                   <td>\${formatResponseTime(item.response_time)}</td>
                   <td>\${formatBeijingTime(item.request_time)}</td>
@@ -778,17 +979,32 @@ async function handleStatusPage(request, env, isInitialized) {
             container.innerHTML = html;
             
           } catch (error) {
-            console.error('Failed to load recent requests:', error);
+            console.error('加载最近请求失败:', error);
+            addDebugLog('加载最近请求失败', { error: error.message });
             document.getElementById('recent-requests').innerHTML = 
-              '<div class="empty-state">加载失败: ' + error.message + '</div>';
+              \`<div class="error-state">
+                <i class="fas fa-exclamation-triangle"></i> 加载失败<br>
+                <small>\${error.message}</small>
+                <button class="btn btn-primary" onclick="loadRecentRequests()" style="margin-top: 10px; font-size: 12px;">
+                  <i class="fas fa-redo"></i> 重试
+                </button>
+              </div>\`;
           }
         }
         
         // 加载后端统计
         async function loadBackendStats() {
+          addDebugLog('开始加载后端统计');
           try {
             const response = await fetch('/api/backend-stats');
+            addDebugLog('收到后端统计响应', { status: response.status });
+            
+            if (!response.ok) {
+              throw new Error(\`HTTP \${response.status}: \${response.statusText}\`);
+            }
+            
             const data = await response.json();
+            addDebugLog('后端统计数据解析成功', { count: data.length });
             
             const container = document.getElementById('backend-stats');
             if (!data || !Array.isArray(data) || data.length === 0) {
@@ -820,6 +1036,7 @@ async function handleStatusPage(request, env, isInitialized) {
                 <tr>
                   <td style="max-width: 150px; word-break: break-all;">
                     <small>\${backend.url || 'N/A'}</small>
+                    \${backend.enabled === 0 ? '<br><small style="color: #dc3545;">已禁用</small>' : ''}
                   </td>
                   <td>
                     <div>请求: \${totalRequests}</div>
@@ -846,14 +1063,22 @@ async function handleStatusPage(request, env, isInitialized) {
             container.innerHTML = html;
             
           } catch (error) {
-            console.error('Failed to load backend stats:', error);
+            console.error('加载后端统计失败:', error);
+            addDebugLog('加载后端统计失败', { error: error.message });
             document.getElementById('backend-stats').innerHTML = 
-              '<div class="empty-state">加载失败: ' + error.message + '</div>';
+              \`<div class="error-state">
+                <i class="fas fa-exclamation-triangle"></i> 加载失败<br>
+                <small>\${error.message}</small>
+                <button class="btn btn-primary" onclick="loadBackendStats()" style="margin-top: 10px; font-size: 12px;">
+                  <i class="fas fa-redo"></i> 重试
+                </button>
+              </div>\`;
           }
         }
         
         // 刷新数据
         function refreshData() {
+          addDebugLog('手动刷新数据');
           const loadingHTML = '<div class="loading"><i class="fas fa-spinner"></i> 加载中...</div>';
           document.getElementById('recent-requests').innerHTML = loadingHTML;
           document.getElementById('backend-stats').innerHTML = loadingHTML;
@@ -862,13 +1087,35 @@ async function handleStatusPage(request, env, isInitialized) {
           loadBackendStats();
         }
         
+        // 测试API连接
+        async function testAPIConnection() {
+          addDebugLog('测试API连接');
+          try {
+            const testUrls = ['/api/backend-stats', '/api/recent-requests'];
+            for (const url of testUrls) {
+              const response = await fetch(url);
+              addDebugLog(\`测试 \${url}\`, { status: response.status, ok: response.ok });
+            }
+          } catch (error) {
+            addDebugLog('API连接测试失败', { error: error.message });
+          }
+        }
+        
         // 页面加载时获取数据
         document.addEventListener('DOMContentLoaded', () => {
+          addDebugLog('页面加载完成');
           loadRecentRequests();
           loadBackendStats();
+          testAPIConnection();
           
           // 每30秒自动刷新
           setInterval(refreshData, 30000);
+          
+          // 检查是否有错误参数
+          const urlParams = new URLSearchParams(window.location.search);
+          if (urlParams.has('debug')) {
+            toggleDebug();
+          }
         });
       </script>
     </body>
@@ -885,12 +1132,16 @@ async function handleStatusPage(request, env, isInitialized) {
 
 // 初始化页面
 async function handleInitPage(request, env) {
+  logInfo('处理初始化页面请求');
+  
   // 确保数据库表存在
   await ensureDatabaseInitialized(env);
   
   // 检查是否有后端数据
   const result = await env.DB.prepare('SELECT COUNT(*) as count FROM backend_servers').first();
   const hasBackends = result && result.count > 0;
+  
+  logInfo(`初始化页面状态: 有后端数据 = ${hasBackends}, 数量 = ${result?.count || 0}`);
   
   const html = `
     <!DOCTYPE html>
@@ -1100,13 +1351,13 @@ async function handleInitPage(request, env) {
           <div class="status-item">
             <span class="status-label">后端服务器:</span>
             <span id="backend-count" class="status-value ${hasBackends ? 'success' : 'error'}">
-              ${hasBackends ? '已配置' : '未配置'}
+              ${hasBackends ? `已配置 (${result.count}个)` : '未配置'}
             </span>
           </div>
         </div>
         
         <div class="default-backends">
-          <h3><i class="fas fa-server"></i> 默认后端服务器</h3>
+          <h3><i class="fas fa-server"></i> 默认后端服务器 (${DEFAULT_BACKENDS.length}个)</h3>
           ${DEFAULT_BACKENDS.map(url => `<div class="backend-url">${url}</div>`).join('')}
         </div>
         
@@ -1151,9 +1402,10 @@ async function handleInitPage(request, env) {
             });
             
             const result = await response.json();
+            console.log('初始化结果:', result);
             
             if (result.success) {
-              showMessage('<i class="fas fa-check-circle"></i> 数据库初始化成功！正在跳转...', 'success');
+              showMessage('<i class="fas fa-check-circle"></i> 数据库初始化成功！添加了' + result.backends_added + '个后端。正在跳转...', 'success');
             } else {
               showMessage('<i class="fas fa-times-circle"></i> 初始化失败: ' + (result.error || '未知错误'), 'error');
               btn.disabled = false;
@@ -1179,7 +1431,7 @@ async function handleInitPage(request, env) {
             const result = await response.json();
             
             if (result.success) {
-              showMessage('<i class="fas fa-check-circle"></i> 数据库重置成功！', 'success');
+              showMessage('<i class="fas fa-check-circle"></i> 数据库重置成功！添加了' + result.backends_added + '个后端。', 'success');
               setTimeout(() => {
                 location.reload();
               }, 1500);
@@ -1204,7 +1456,9 @@ async function handleInitPage(request, env) {
 
 // API: 初始化数据库
 async function handleInitDatabase(request, env) {
+  logInfo('处理数据库初始化API请求');
   if (request.method !== 'POST') {
+    logError('数据库初始化请求方法不正确', { method: request.method });
     return new Response(JSON.stringify({ error: 'Method not allowed' }), {
       status: 405,
       headers: {
@@ -1219,11 +1473,15 @@ async function handleInitDatabase(request, env) {
     await ensureDatabaseInitialized(env);
     
     // 清空现有数据
+    logDebug('清空现有数据');
     await env.DB.prepare('DELETE FROM backend_servers').run();
     await env.DB.prepare('DELETE FROM request_logs').run();
     
     // 插入默认后端地址
     let inserted = 0;
+    let errors = [];
+    
+    logInfo(`开始插入默认后端地址 (共${DEFAULT_BACKENDS.length}个)`);
     for (const url of DEFAULT_BACKENDS) {
       try {
         await env.DB.prepare(`
@@ -1231,16 +1489,22 @@ async function handleInitDatabase(request, env) {
           VALUES (?, ?, ?)
         `).bind(url, INITIAL_WEIGHT, INITIAL_WEIGHT).run();
         inserted++;
+        logDebug(`插入后端成功: ${url}`);
       } catch (error) {
-        console.error(`Failed to insert backend ${url}:`, error);
+        logError(`插入后端失败: ${url}`, error);
+        errors.push({ url, error: error.message });
         // 继续插入其他后端
       }
     }
     
+    logInfo(`数据库初始化完成: 成功插入${inserted}个后端, 失败${errors.length}个`);
+    
     return new Response(JSON.stringify({
       success: true,
       message: 'Database initialized successfully',
-      backends_added: inserted
+      backends_added: inserted,
+      errors: errors,
+      total_backends: DEFAULT_BACKENDS.length
     }), {
       headers: {
         'Content-Type': 'application/json',
@@ -1249,10 +1513,11 @@ async function handleInitDatabase(request, env) {
     });
     
   } catch (error) {
-    console.error('Database initialization error:', error);
+    logError('数据库初始化错误', error);
     return new Response(JSON.stringify({
       success: false,
-      error: error.message
+      error: error.message,
+      stack: error.stack
     }), {
       status: 500,
       headers: {
@@ -1265,6 +1530,7 @@ async function handleInitDatabase(request, env) {
 
 // API: 获取后端统计
 async function handleBackendStats(request, env) {
+  logDebug('开始获取后端统计');
   try {
     const result = await env.DB.prepare(`
       SELECT 
@@ -1276,6 +1542,9 @@ async function handleBackendStats(request, env) {
       ORDER BY dynamic_weight DESC
     `).all();
     
+    logDebug(`获取后端统计成功: 找到${result.results?.length || 0}条记录`);
+    logDebug('后端统计详细数据:', result.results);
+    
     return new Response(JSON.stringify(result.results || []), {
       headers: {
         'Content-Type': 'application/json',
@@ -1285,8 +1554,12 @@ async function handleBackendStats(request, env) {
     });
     
   } catch (error) {
-    console.error('Error fetching backend stats:', error);
-    return new Response(JSON.stringify([]), {
+    logError('获取后端统计时发生错误', error);
+    return new Response(JSON.stringify({
+      error: error.message,
+      stack: error.stack
+    }), {
+      status: 500,
       headers: {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
@@ -1298,6 +1571,7 @@ async function handleBackendStats(request, env) {
 
 // API: 获取最近请求
 async function handleRecentRequests(request, env) {
+  logDebug('开始获取最近请求');
   try {
     const result = await env.DB.prepare(`
       SELECT 
@@ -1306,6 +1580,8 @@ async function handleRecentRequests(request, env) {
       ORDER BY request_time DESC
       LIMIT 20
     `).all();
+    
+    logDebug(`获取最近请求成功: 找到${result.results?.length || 0}条记录`);
     
     return new Response(JSON.stringify(result.results || []), {
       headers: {
@@ -1316,8 +1592,12 @@ async function handleRecentRequests(request, env) {
     });
     
   } catch (error) {
-    console.error('Error fetching recent requests:', error);
-    return new Response(JSON.stringify([]), {
+    logError('获取最近请求时发生错误', error);
+    return new Response(JSON.stringify({
+      error: error.message,
+      stack: error.stack
+    }), {
+      status: 500,
       headers: {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
