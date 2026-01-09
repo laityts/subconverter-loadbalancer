@@ -185,7 +185,7 @@ async function createDatabaseTables(env) {
     
     logDebug('后端服务器表创建成功');
     
-    // 创建请求日志表
+    // 创建请求日志表 - 增加dynamic_weight字段
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS request_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,6 +193,7 @@ async function createDatabaseTables(env) {
         response_time REAL NOT NULL,
         status TEXT NOT NULL,
         error_message TEXT,
+        dynamic_weight REAL, -- 新增：记录请求时的动态权重
         request_time TIMESTAMP NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
@@ -274,15 +275,19 @@ async function handleSubscriptionRequest(request, env) {
         logInfo('后端响应成功');
       }
       
+      // 获取当前动态权重
+      const currentDynamicWeight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
+      
       // 更新后端统计信息
       await updateBackendStats(env, backend.id, status === 'success', responseTime);
       
-      // 记录请求日志
+      // 记录请求日志（包含动态权重）
       await logRequest(env, {
         backend_url: backend.url,
         response_time: responseTime,
         status: status,
         error_message: errorMsg,
+        dynamic_weight: currentDynamicWeight, // 记录请求时的动态权重
         request_time: new Date().toISOString()
       });
       
@@ -306,15 +311,19 @@ async function handleSubscriptionRequest(request, env) {
       errorMsg = error.message;
       logError('请求后端时发生错误', error);
       
+      // 获取当前动态权重
+      const currentDynamicWeight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
+      
       // 更新后端统计信息（失败）
       await updateBackendStats(env, backend.id, false, responseTime);
       
-      // 记录请求日志
+      // 记录请求日志（包含动态权重）
       await logRequest(env, {
         backend_url: backend.url,
         response_time: responseTime,
         status: status,
         error_message: errorMsg,
+        dynamic_weight: currentDynamicWeight, // 记录请求时的动态权重
         request_time: new Date().toISOString()
       });
       
@@ -530,13 +539,14 @@ async function logRequest(env, data) {
   logDebug('记录请求日志:', data);
   try {
     await env.DB.prepare(`
-      INSERT INTO request_logs (backend_url, response_time, status, error_message, request_time)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO request_logs (backend_url, response_time, status, error_message, dynamic_weight, request_time)
+      VALUES (?, ?, ?, ?, ?, ?)
     `).bind(
       data.backend_url,
       data.response_time,
       data.status,
       data.error_message || '',
+      data.dynamic_weight || 0,
       data.request_time
     ).run();
     
@@ -632,7 +642,7 @@ async function handleRecentRequests(request, env) {
   try {
     const result = await env.DB.prepare(`
       SELECT 
-        id, backend_url, response_time, status, error_message, request_time,
+        id, backend_url, response_time, status, error_message, dynamic_weight, request_time,
         created_at
       FROM request_logs
       ORDER BY request_time DESC
@@ -651,6 +661,7 @@ async function handleRecentRequests(request, env) {
       response_time: log.response_time || 0,
       status: log.status || 'unknown',
       error_message: log.error_message || '',
+      dynamic_weight: log.dynamic_weight || 0, // 包含动态权重
       request_time: log.request_time || new Date().toISOString(),
       created_at: log.created_at || new Date().toISOString()
     }));
@@ -716,7 +727,7 @@ async function handleStatusPage(request, env, isInitialized) {
     
     const logsResult = await env.DB.prepare(`
       SELECT 
-        backend_url, response_time, status, error_message, request_time
+        backend_url, response_time, status, error_message, dynamic_weight, request_time
       FROM request_logs
       ORDER BY request_time DESC
       LIMIT 10
@@ -752,6 +763,7 @@ async function handleStatusPage(request, env, isInitialized) {
           --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.1);
           --radius-md: 12px;
           --radius-lg: 16px;
+          --weight-gradient: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); /* 权重显示渐变色 */
         }
         
         * {
@@ -1003,6 +1015,39 @@ async function handleStatusPage(request, env, isInitialized) {
           color: #742a2a;
         }
         
+        /* 动态权重徽章基础样式 */
+        .weight-badge {
+          display: inline-block;
+          padding: 6px 12px;
+          background: var(--weight-gradient);
+          color: #22543d;
+          border-radius: 20px;
+          font-size: 13px;
+          font-weight: 700;
+          text-align: center;
+          min-width: 60px;
+          box-shadow: 0 2px 4px rgba(67, 233, 123, 0.3);
+          transition: transform 0.2s ease;
+        }
+        
+        .weight-badge:hover {
+          transform: scale(1.05);
+        }
+        
+        /* 权重信息容器 */
+        .weight-info {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        
+        .weight-label {
+          font-size: 12px;
+          color: var(--text-secondary);
+          white-space: nowrap;
+        }
+        
         /* 进度条 */
         .progress-container {
           background: #e2e8f0;
@@ -1187,15 +1232,7 @@ async function handleStatusPage(request, env, isInitialized) {
             color: var(--text-primary);
           }
           
-          /* 修改：移动端最近请求记录后端地址移除状态徽章 */
-          #recent-requests-container .stats-table td:first-child .mobile-row .status-badge {
-            display: none !important;
-          }
-          
-          #recent-requests-container .stats-table td:first-child > div:not(.mobile-row) {
-            display: none !important;
-          }
-          
+          /* 修改：移动端最近请求记录显示优化 */
           #recent-requests-container .stats-table td:first-child .mobile-row {
             display: block;
             margin-bottom: 0;
@@ -1213,6 +1250,19 @@ async function handleStatusPage(request, env, isInitialized) {
           .title-section p {
             text-align: center;
             width: 100%;
+          }
+          
+          /* 移动端适配 - 权重徽章 */
+          .weight-badge {
+            font-size: 12px;
+            padding: 4px 8px;
+            min-width: 50px;
+          }
+          
+          .weight-info {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 5px;
           }
         }
         
@@ -1243,6 +1293,13 @@ async function handleStatusPage(request, env, isInitialized) {
           
           .progress-container {
             background: #4a5568;
+          }
+          
+          /* 暗色主题适配 - 权重徽章 */
+          .weight-badge {
+            background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
+            color: #81e6d9;
+            border: 1px solid #38a169;
           }
         }
       </style>
@@ -1401,6 +1458,7 @@ async function handleStatusPage(request, env, isInitialized) {
                       <tr>
                         <th>后端地址</th>
                         <th>状态</th>
+                        <th>动态权重</th>
                         <th>响应时间</th>
                         <th>请求时间</th>
                       </tr>
@@ -1409,12 +1467,14 @@ async function handleStatusPage(request, env, isInitialized) {
                       ${recentRequests.map(log => {
                         const statusClass = log.status === 'success' ? 'status-success' : 'status-failed';
                         const statusText = log.status === 'success' ? '成功' : '失败';
+                        const dynamicWeight = log.dynamic_weight || 0;
+                        const weightLevel = dynamicWeight >= 15 ? '高权重' : dynamicWeight >= 10 ? '中权重' : '低权重';
                         
                         return `
                         <tr>
                           <td data-label="后端地址">
                             <div class="mobile-row">
-                              ${log.backend_url || '未知'}
+                              <span>${log.backend_url || '未知'}</span>
                             </div>
                             <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
                               ${log.backend_url || '未知'}
@@ -1429,6 +1489,12 @@ async function handleStatusPage(request, env, isInitialized) {
                                 </small>
                               </div>
                             ` : ''}
+                          </td>
+                          <td data-label="动态权重">
+                            <div class="weight-info">
+                              <span class="weight-badge" title="请求时的动态权重">${dynamicWeight.toFixed(1)}</span>
+                              <div class="weight-label">${weightLevel}</div>
+                            </div>
                           </td>
                           <td data-label="响应时间">
                             ${formatResponseTimeForHTML(log.response_time || 0)}
@@ -1755,6 +1821,7 @@ async function handleStatusPage(request, env, isInitialized) {
                     <tr>
                       <th>后端地址</th>
                       <th>状态</th>
+                      <th>动态权重</th>
                       <th>响应时间</th>
                       <th>请求时间</th>
                     </tr>
@@ -1765,6 +1832,8 @@ async function handleStatusPage(request, env, isInitialized) {
             data.forEach(log => {
               const statusClass = log.status === 'success' ? 'status-success' : 'status-failed';
               const statusText = log.status === 'success' ? '成功' : '失败';
+              const dynamicWeight = log.dynamic_weight || 0;
+              const weightLevel = dynamicWeight >= 15 ? '高权重' : dynamicWeight >= 10 ? '中权重' : '低权重';
               
               html += \`
                 <tr>
@@ -1785,6 +1854,12 @@ async function handleStatusPage(request, env, isInitialized) {
                         </small>
                       </div>
                     \` : ''}
+                  </td>
+                  <td data-label="动态权重">
+                    <div class="weight-info">
+                      <span class="weight-badge" title="请求时的动态权重">\${dynamicWeight.toFixed(1)}</span>
+                      <div class="weight-label">\${weightLevel}</div>
+                    </div>
                   </td>
                   <td data-label="响应时间">
                     \${formatResponseTime(log.response_time || 0)}
@@ -1947,6 +2022,7 @@ async function handleInitPage(request, env) {
           --border-color: #e2e8f0;
           --shadow-lg: 0 20px 40px rgba(0, 0, 0, 0.1);
           --radius-lg: 20px;
+          --weight-gradient: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); /* 权重显示渐变色 */
         }
         
         * {
