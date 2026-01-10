@@ -1232,14 +1232,17 @@ async function handleStatusPage(request, env, isInitialized) {
             color: var(--text-primary);
           }
           
-          /* 修改：移动端最近请求记录显示优化 */
+          /* 修改：移动端最近请求记录显示优化 - 隐藏桌面端div，只显示mobile-row */
+          #recent-requests-container .stats-table td:first-child > div:not(.mobile-row) {
+            display: none !important;
+          }
+          
           #recent-requests-container .stats-table td:first-child .mobile-row {
             display: block;
             margin-bottom: 0;
-            justify-content: flex-start;
           }
           
-          #recent-requests-container .stats-table td:first-child .mobile-row span:not(.status-badge) {
+          #recent-requests-container .stats-table td:first-child .mobile-row strong {
             display: block;
             word-break: break-all;
             font-size: 14px;
@@ -1474,7 +1477,7 @@ async function handleStatusPage(request, env, isInitialized) {
                         <tr>
                           <td data-label="后端地址">
                             <div class="mobile-row">
-                              <span>${log.backend_url || '未知'}</span>
+                              <strong>${log.backend_url || '未知'}</strong>
                             </div>
                             <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
                               ${log.backend_url || '未知'}
@@ -1839,7 +1842,7 @@ async function handleStatusPage(request, env, isInitialized) {
                 <tr>
                   <td data-label="后端地址">
                     <div class="mobile-row">
-                      \${log.backend_url || '未知'}
+                      <strong>\${log.backend_url || '未知'}</strong>
                     </div>
                     <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
                       \${log.backend_url || '未知'}
