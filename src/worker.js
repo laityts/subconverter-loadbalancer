@@ -20,6 +20,47 @@ const FAILURE_WEIGHT_DECREMENT = 2; // 失败时权重减少
 const MAX_WEIGHT = 20; // 最大权重
 const MIN_WEIGHT = 1;  // 最小权重
 
+// 数据库表结构定义
+const TABLE_SCHEMAS = {
+  backend_servers: {
+    columns: [
+      { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT' },
+      { name: 'url', type: 'TEXT NOT NULL UNIQUE' },
+      { name: 'weight', type: 'INTEGER DEFAULT 10' },
+      { name: 'dynamic_weight', type: 'REAL DEFAULT 10' },
+      { name: 'total_requests', type: 'INTEGER DEFAULT 0' },
+      { name: 'success_count', type: 'INTEGER DEFAULT 0' },
+      { name: 'fail_count', type: 'INTEGER DEFAULT 0' },
+      { name: 'average_response_time', type: 'REAL DEFAULT 0' },
+      { name: 'last_response_time', type: 'REAL DEFAULT 0' },
+      { name: 'last_used', type: 'TIMESTAMP' },
+      { name: 'enabled', type: 'BOOLEAN DEFAULT 1' },
+      { name: 'created_at', type: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
+      { name: 'updated_at', type: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' }
+    ],
+    indexes: [
+      'CREATE INDEX IF NOT EXISTS idx_backend_servers_weight ON backend_servers(dynamic_weight DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled)'
+    ]
+  },
+  request_logs: {
+    columns: [
+      { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT' },
+      { name: 'backend_url', type: 'TEXT NOT NULL' },
+      { name: 'response_time', type: 'REAL NOT NULL' },
+      { name: 'status', type: 'TEXT NOT NULL' },
+      { name: 'error_message', type: 'TEXT' },
+      { name: 'dynamic_weight', type: 'REAL' },
+      { name: 'request_time', type: 'TIMESTAMP NOT NULL' },
+      { name: 'created_at', type: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' }
+    ],
+    indexes: [
+      'CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(request_time DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_request_logs_backend ON request_logs(backend_url)'
+    ]
+  }
+};
+
 // 调试日志函数
 function logDebug(message, data = null) {
   const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
@@ -134,26 +175,130 @@ function handleOptions(request) {
   });
 }
 
+// 检查表是否存在
+async function checkTableExists(env, tableName) {
+  try {
+    const result = await env.DB.prepare(`
+      SELECT name FROM sqlite_master 
+      WHERE type='table' AND name = ?
+    `).bind(tableName).first();
+    
+    return result !== null;
+  } catch (error) {
+    logError(`检查表 ${tableName} 是否存在时出错`, error);
+    return false;
+  }
+}
+
+// 获取表的列信息
+async function getTableColumns(env, tableName) {
+  try {
+    const result = await env.DB.prepare(`PRAGMA table_info(${tableName})`).all();
+    
+    if (result.results) {
+      return result.results.map(col => ({
+        name: col.name,
+        type: col.type,
+        notnull: col.notnull,
+        dflt_value: col.dflt_value,
+        pk: col.pk
+      }));
+    }
+    return [];
+  } catch (error) {
+    logError(`获取表 ${tableName} 列信息时出错`, error);
+    return [];
+  }
+}
+
+// 更新表结构，添加缺失的列
+async function updateTableSchema(env, tableName) {
+  logDebug(`开始更新表结构: ${tableName}`);
+  
+  if (!TABLE_SCHEMAS[tableName]) {
+    logError(`未找到表 ${tableName} 的结构定义`);
+    return false;
+  }
+  
+  try {
+    // 获取现有列
+    const existingColumns = await getTableColumns(env, tableName);
+    const existingColumnNames = existingColumns.map(col => col.name.toLowerCase());
+    
+    logDebug(`表 ${tableName} 现有列:`, existingColumnNames);
+    
+    // 检查并添加缺失的列
+    const schemaColumns = TABLE_SCHEMAS[tableName].columns;
+    let columnsAdded = 0;
+    
+    for (const columnDef of schemaColumns) {
+      const columnName = columnDef.name.toLowerCase();
+      
+      if (!existingColumnNames.includes(columnName)) {
+        // 列不存在，需要添加
+        logInfo(`表 ${tableName} 添加缺失列: ${columnDef.name} (${columnDef.type})`);
+        
+        try {
+          await env.DB.prepare(`
+            ALTER TABLE ${tableName} 
+            ADD COLUMN ${columnDef.name} ${columnDef.type}
+          `).run();
+          
+          columnsAdded++;
+          logDebug(`列 ${columnDef.name} 添加成功`);
+        } catch (addError) {
+          logError(`添加列 ${columnDef.name} 失败`, addError);
+        }
+      }
+    }
+    
+    // 创建索引（如果不存在）
+    const indexes = TABLE_SCHEMAS[tableName].indexes || [];
+    for (const indexSQL of indexes) {
+      try {
+        await env.DB.prepare(indexSQL).run();
+        logDebug(`表 ${tableName} 索引创建/检查完成: ${indexSQL.substring(0, 50)}...`);
+      } catch (indexError) {
+        logError(`创建索引失败: ${indexSQL.substring(0, 50)}...`, indexError);
+      }
+    }
+    
+    if (columnsAdded > 0) {
+      logInfo(`表 ${tableName} 结构更新完成，添加了 ${columnsAdded} 个列`);
+    } else {
+      logDebug(`表 ${tableName} 结构已是最新`);
+    }
+    
+    return true;
+  } catch (error) {
+    logError(`更新表 ${tableName} 结构时出错`, error);
+    return false;
+  }
+}
+
 // 确保数据库已初始化
 async function ensureDatabaseInitialized(env) {
   logDebug('开始检查数据库初始化状态');
   try {
     // 检查表是否存在
-    const tables = await env.DB.prepare(`
-      SELECT name FROM sqlite_master 
-      WHERE type='table' AND name IN ('backend_servers', 'request_logs')
-    `).all();
+    const backendTableExists = await checkTableExists(env, 'backend_servers');
+    const logsTableExists = await checkTableExists(env, 'request_logs');
     
-    logDebug('数据库表检查结果:', tables);
+    logDebug(`表存在状态: backend_servers=${backendTableExists}, request_logs=${logsTableExists}`);
     
     // 如果表不存在，创建它们
-    if (!tables.results || tables.results.length < 2) {
-      logInfo('数据库表不存在，开始创建表');
+    if (!backendTableExists || !logsTableExists) {
+      logInfo('数据库表不存在或部分缺失，开始创建表');
       await createDatabaseTables(env);
       logInfo('数据库表创建完成');
     } else {
-      logDebug('数据库表已存在');
+      logDebug('数据库表已存在，检查表结构更新');
+      
+      // 更新表结构
+      await updateTableSchema(env, 'backend_servers');
+      await updateTableSchema(env, 'request_logs');
     }
+    
     return true;
   } catch (error) {
     logError('检查数据库初始化状态失败', error);
@@ -167,50 +312,39 @@ async function createDatabaseTables(env) {
     logDebug('开始创建数据库表');
     
     // 创建后端服务器表
+    const backendColumns = TABLE_SCHEMAS.backend_servers.columns
+      .map(col => `${col.name} ${col.type}`)
+      .join(',\n      ');
+    
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS backend_servers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT NOT NULL UNIQUE,
-        weight INTEGER DEFAULT ${INITIAL_WEIGHT},
-        dynamic_weight REAL DEFAULT ${INITIAL_WEIGHT},
-        total_requests INTEGER DEFAULT 0,
-        success_count INTEGER DEFAULT 0,
-        fail_count INTEGER DEFAULT 0,
-        average_response_time REAL DEFAULT 0,
-        last_response_time REAL DEFAULT 0,
-        last_used TIMESTAMP,
-        enabled BOOLEAN DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ${backendColumns}
       )
     `).run();
     
     logDebug('后端服务器表创建成功');
     
-    // 创建请求日志表 - 增加dynamic_weight字段
+    // 创建请求日志表
+    const logsColumns = TABLE_SCHEMAS.request_logs.columns
+      .map(col => `${col.name} ${col.type}`)
+      .join(',\n      ');
+    
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS request_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        backend_url TEXT NOT NULL,
-        response_time REAL NOT NULL,
-        status TEXT NOT NULL,
-        error_message TEXT,
-        dynamic_weight REAL, -- 新增：记录请求时的动态权重
-        request_time TIMESTAMP NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ${logsColumns}
       )
     `).run();
     
     logDebug('请求日志表创建成功');
     
     // 创建索引
-    await env.DB.prepare(`
-      CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(request_time DESC)
-    `).run();
+    for (const indexSQL of TABLE_SCHEMAS.backend_servers.indexes) {
+      await env.DB.prepare(indexSQL).run();
+    }
     
-    await env.DB.prepare(`
-      CREATE INDEX IF NOT EXISTS idx_backend_servers_weight ON backend_servers(dynamic_weight DESC)
-    `).run();
+    for (const indexSQL of TABLE_SCHEMAS.request_logs.indexes) {
+      await env.DB.prepare(indexSQL).run();
+    }
     
     logDebug('数据库索引创建成功');
     logInfo('数据库表创建完成');
