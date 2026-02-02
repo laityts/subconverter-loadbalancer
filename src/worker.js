@@ -8,7 +8,9 @@ const BEIJING_TIMEZONE = 'Asia/Shanghai';
 const DEFAULT_BACKENDS = [
   'https://url.v1.mk',
   'https://subapi.cmliussss.net',
-  'https://subapi.sosoorg.com'
+  'https://subapi.sosoorg.com',
+  'https://subapi.fxxk.dedyn.io',
+  'https://subapi.zrfme.com'
 ];
 
 // 权重配置
