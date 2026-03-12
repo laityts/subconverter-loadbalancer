@@ -15,10 +15,8 @@ const DEFAULT_BACKENDS = [
 
 // 权重配置
 const INITIAL_WEIGHT = 10; // 初始权重
-const SUCCESS_WEIGHT_INCREMENT = 1; // 成功时权重增加
-const FAILURE_WEIGHT_DECREMENT = 2; // 失败时权重减少
-const MAX_WEIGHT = 20; // 最大权重
-const MIN_WEIGHT = 1;  // 最小权重
+const MAX_WEIGHT = 20;     // 最大权重
+const MIN_WEIGHT = 1;      // 最小权重
 
 // 数据库表结构定义
 const TABLE_SCHEMAS = {
@@ -355,6 +353,200 @@ async function createDatabaseTables(env) {
   }
 }
 
+// ---------- 基于最近20条请求计算权重 ----------
+async function computeBackendWeight(env, backendUrl) {
+  try {
+    // 查询最近20条请求日志
+    const logs = await env.DB.prepare(`
+      SELECT status FROM request_logs
+      WHERE backend_url = ?
+      ORDER BY request_time DESC
+      LIMIT 20
+    `).bind(backendUrl).all();
+    
+    const records = logs.results || [];
+    const total = records.length;
+    if (total === 0) {
+      return INITIAL_WEIGHT; // 默认权重10
+    }
+    
+    const successCount = records.filter(r => r.status === 'success').length;
+    const successRate = successCount / total;
+    // 权重映射到1-20
+    let weight = Math.max(MIN_WEIGHT, Math.min(MAX_WEIGHT, Math.round(successRate * MAX_WEIGHT)));
+    return weight;
+  } catch (error) {
+    logError(`计算后端权重失败: url=${backendUrl}`, error);
+    return INITIAL_WEIGHT;
+  }
+}
+
+// 智能选择后端（基于最近20条成功率加权轮询）
+async function selectBackend(env) {
+  logDebug('开始选择后端（基于最近20条请求成功率）');
+  try {
+    // 获取所有启用的后端
+    const result = await env.DB.prepare(`
+      SELECT id, url, weight
+      FROM backend_servers
+      WHERE enabled = 1
+    `).all();
+    
+    if (!result.results || result.results.length === 0) {
+      logError('数据库中没有启用的后端服务器');
+      return null;
+    }
+    
+    const backends = result.results;
+    logInfo(`找到 ${backends.length} 个启用的后端服务器，正在计算权重...`);
+    
+    // 为每个后端计算权重（基于最近20条成功率）
+    const weightedBackends = [];
+    for (const backend of backends) {
+      const weight = await computeBackendWeight(env, backend.url);
+      weightedBackends.push({
+        ...backend,
+        dynamic_weight: weight // 临时存储权重
+      });
+    }
+    
+    // 计算总权重
+    let totalWeight = 0;
+    for (const b of weightedBackends) {
+      totalWeight += b.dynamic_weight;
+    }
+    
+    if (totalWeight === 0) {
+      // 如果所有权重都是0（不太可能），使用基础权重
+      logDebug('总权重为0，使用基础权重');
+      for (const b of weightedBackends) {
+        b.dynamic_weight = b.weight || INITIAL_WEIGHT;
+        totalWeight += b.dynamic_weight;
+      }
+    }
+    
+    // 加权随机选择
+    let random = Math.random() * totalWeight;
+    let selectedBackend = null;
+    for (const backend of weightedBackends) {
+      random -= backend.dynamic_weight;
+      if (random <= 0) {
+        selectedBackend = backend;
+        break;
+      }
+    }
+    
+    if (!selectedBackend) {
+      selectedBackend = weightedBackends[0];
+    }
+    
+    logInfo(`选择了后端: ${selectedBackend.url}, 计算权重: ${selectedBackend.dynamic_weight}`);
+    return selectedBackend;
+    
+  } catch (error) {
+    logError('选择后端时发生错误', error);
+    return null;
+  }
+}
+
+// 更新后端统计信息（包括基于最近成功率的动态权重）
+async function updateBackendStats(env, backendId, backendUrl, success, responseTime) {
+  logDebug(`更新后端统计: id=${backendId}, url=${backendUrl}, success=${success}, responseTime=${responseTime}ms`);
+  try {
+    // 获取当前统计信息
+    const result = await env.DB.prepare(`
+      SELECT total_requests, success_count, fail_count, average_response_time, weight
+      FROM backend_servers
+      WHERE id = ?
+    `).bind(backendId).first();
+    
+    if (!result) {
+      logError(`找不到后端ID: ${backendId}`);
+      return;
+    }
+    
+    logDebug('当前后端统计:', result);
+    
+    // 计算新的统计数据
+    const totalRequests = result.total_requests + 1;
+    const successCount = result.success_count + (success ? 1 : 0);
+    const failCount = result.fail_count + (success ? 0 : 1);
+    
+    // 计算新的平均响应时间
+    let avgResponseTime;
+    if (result.total_requests === 0) {
+      avgResponseTime = responseTime;
+    } else {
+      avgResponseTime = (result.average_response_time * result.total_requests + responseTime) / totalRequests;
+    }
+    
+    // 基于最近20条请求重新计算动态权重（此时新日志已插入）
+    const newDynamicWeight = await computeBackendWeight(env, backendUrl);
+    logDebug(`重新计算动态权重: ${newDynamicWeight}`);
+    
+    // 更新数据库
+    await env.DB.prepare(`
+      UPDATE backend_servers 
+      SET total_requests = ?, 
+          success_count = ?, 
+          fail_count = ?, 
+          average_response_time = ?,
+          last_response_time = ?,
+          dynamic_weight = ?,
+          last_used = datetime('now')
+      WHERE id = ?
+    `).bind(
+      totalRequests,
+      successCount,
+      failCount,
+      avgResponseTime,
+      responseTime,
+      newDynamicWeight,
+      backendId
+    ).run();
+    
+    logInfo(`后端统计更新完成: id=${backendId}, 总请求=${totalRequests}, 成功=${successCount}, 失败=${failCount}, 平均响应=${avgResponseTime.toFixed(2)}ms, 动态权重=${newDynamicWeight}`);
+    
+  } catch (error) {
+    logError('更新后端统计时发生错误', error);
+  }
+}
+
+// 记录请求日志
+async function logRequest(env, data) {
+  logDebug('记录请求日志:', data);
+  try {
+    await env.DB.prepare(`
+      INSERT INTO request_logs (backend_url, response_time, status, error_message, dynamic_weight, request_time)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      data.backend_url,
+      data.response_time,
+      data.status,
+      data.error_message || '',
+      data.dynamic_weight || 0,
+      data.request_time
+    ).run();
+    
+    logDebug('请求日志插入成功');
+    
+    // 清理旧的日志（保留最近100条）
+    await env.DB.prepare(`
+      DELETE FROM request_logs 
+      WHERE id NOT IN (
+        SELECT id FROM request_logs 
+        ORDER BY request_time DESC 
+        LIMIT 100
+      )
+    `).run();
+    
+    logDebug('清理旧日志完成');
+    
+  } catch (error) {
+    logError('记录请求日志时发生错误', error);
+  }
+}
+
 // 处理订阅转换请求
 async function handleSubscriptionRequest(request, env) {
   logDebug('开始处理订阅转换请求');
@@ -411,13 +603,10 @@ async function handleSubscriptionRequest(request, env) {
         logInfo('后端响应成功');
       }
       
-      // 获取当前动态权重
+      // 获取当前动态权重（用于日志）
       const currentDynamicWeight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
       
-      // 更新后端统计信息
-      await updateBackendStats(env, backend.id, status === 'success', responseTime);
-      
-      // 记录请求日志（包含动态权重）
+      // 先记录请求日志（包含本次请求，以便后续权重计算使用）
       await logRequest(env, {
         backend_url: backend.url,
         response_time: responseTime,
@@ -426,6 +615,9 @@ async function handleSubscriptionRequest(request, env) {
         dynamic_weight: currentDynamicWeight, // 记录请求时的动态权重
         request_time: new Date().toISOString()
       });
+      
+      // 更新后端统计信息（基于最新日志重新计算权重）
+      await updateBackendStats(env, backend.id, backend.url, status === 'success', responseTime);
       
       // 创建新的响应头（避免缓存）
       const headers = new Headers(response.headers);
@@ -450,18 +642,18 @@ async function handleSubscriptionRequest(request, env) {
       // 获取当前动态权重
       const currentDynamicWeight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
       
-      // 更新后端统计信息（失败）
-      await updateBackendStats(env, backend.id, false, responseTime);
-      
-      // 记录请求日志（包含动态权重）
+      // 先记录请求日志
       await logRequest(env, {
         backend_url: backend.url,
         response_time: responseTime,
         status: status,
         error_message: errorMsg,
-        dynamic_weight: currentDynamicWeight, // 记录请求时的动态权重
+        dynamic_weight: currentDynamicWeight,
         request_time: new Date().toISOString()
       });
+      
+      // 更新后端统计信息（失败）
+      await updateBackendStats(env, backend.id, backend.url, false, responseTime);
       
       return new Response(`Backend error: ${error.message}`, {
         status: 502,
@@ -531,177 +723,6 @@ async function handleVersionRequest(request, env) {
         'Content-Type': 'text/plain; charset=utf-8'
       }
     });
-  }
-}
-
-// 智能选择后端（加权轮询）
-async function selectBackend(env) {
-  logDebug('开始选择后端');
-  try {
-    // 从数据库获取所有启用的后端
-    const result = await env.DB.prepare(`
-      SELECT id, url, weight, total_requests, success_count, fail_count, 
-             average_response_time, dynamic_weight
-      FROM backend_servers
-      WHERE enabled = 1
-      ORDER BY dynamic_weight DESC, average_response_time ASC
-    `).all();
-    
-    logDebug('数据库查询结果:', result);
-    
-    if (!result.results || result.results.length === 0) {
-      logError('数据库中没有启用的后端服务器');
-      return null;
-    }
-    
-    const backends = result.results;
-    logInfo(`找到 ${backends.length} 个启用的后端服务器`);
-    
-    // 计算总权重
-    let totalWeight = 0;
-    for (const backend of backends) {
-      totalWeight += backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
-    }
-    
-    // 如果没有配置动态权重，使用基础权重
-    if (totalWeight === 0) {
-      logDebug('动态权重为0，使用基础权重');
-      for (const backend of backends) {
-        totalWeight += backend.weight || INITIAL_WEIGHT;
-      }
-    }
-    
-    logDebug(`总权重: ${totalWeight}`);
-    
-    // 随机选择一个（基于权重）
-    let random = Math.random() * totalWeight;
-    let selectedBackend = null;
-    
-    for (const backend of backends) {
-      const weight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
-      random -= weight;
-      if (random <= 0) {
-        selectedBackend = backend;
-        break;
-      }
-    }
-    
-    // 如果随机选择失败，选择第一个
-    if (!selectedBackend) {
-      logDebug('随机选择失败，选择第一个后端');
-      selectedBackend = backends[0];
-    }
-    
-    logInfo(`选择了后端: ${selectedBackend.url}, 权重: ${selectedBackend.dynamic_weight || selectedBackend.weight}`);
-    return selectedBackend;
-    
-  } catch (error) {
-    logError('选择后端时发生错误', error);
-    return null;
-  }
-}
-
-// 更新后端统计信息
-async function updateBackendStats(env, backendId, success, responseTime) {
-  logDebug(`更新后端统计: id=${backendId}, success=${success}, responseTime=${responseTime}ms`);
-  try {
-    // 获取当前统计信息
-    const result = await env.DB.prepare(`
-      SELECT total_requests, success_count, fail_count, average_response_time, weight, dynamic_weight
-      FROM backend_servers
-      WHERE id = ?
-    `).bind(backendId).first();
-    
-    if (!result) {
-      logError(`找不到后端ID: ${backendId}`);
-      return;
-    }
-    
-    logDebug('当前后端统计:', result);
-    
-    // 计算新的统计数据
-    const totalRequests = result.total_requests + 1;
-    const successCount = result.success_count + (success ? 1 : 0);
-    const failCount = result.fail_count + (success ? 0 : 1);
-    
-    // 计算新的平均响应时间
-    let avgResponseTime;
-    if (result.total_requests === 0) {
-      avgResponseTime = responseTime;
-    } else {
-      avgResponseTime = (result.average_response_time * result.total_requests + responseTime) / totalRequests;
-    }
-    
-    // 更新动态权重
-    let dynamicWeight = result.dynamic_weight || result.weight || INITIAL_WEIGHT;
-    if (success) {
-      dynamicWeight = Math.min(dynamicWeight + SUCCESS_WEIGHT_INCREMENT, MAX_WEIGHT);
-      logDebug(`请求成功，权重增加: ${dynamicWeight}`);
-    } else {
-      dynamicWeight = Math.max(dynamicWeight - FAILURE_WEIGHT_DECREMENT, MIN_WEIGHT);
-      logDebug(`请求失败，权重减少: ${dynamicWeight}`);
-    }
-    
-    // 更新数据库
-    await env.DB.prepare(`
-      UPDATE backend_servers 
-      SET total_requests = ?, 
-          success_count = ?, 
-          fail_count = ?, 
-          average_response_time = ?,
-          last_response_time = ?,
-          dynamic_weight = ?,
-          last_used = datetime('now')
-      WHERE id = ?
-    `).bind(
-      totalRequests,
-      successCount,
-      failCount,
-      avgResponseTime,
-      responseTime,
-      dynamicWeight,
-      backendId
-    ).run();
-    
-    logInfo(`后端统计更新完成: id=${backendId}, 总请求=${totalRequests}, 成功=${successCount}, 失败=${failCount}, 平均响应=${avgResponseTime.toFixed(2)}ms, 动态权重=${dynamicWeight}`);
-    
-  } catch (error) {
-    logError('更新后端统计时发生错误', error);
-  }
-}
-
-// 记录请求日志
-async function logRequest(env, data) {
-  logDebug('记录请求日志:', data);
-  try {
-    await env.DB.prepare(`
-      INSERT INTO request_logs (backend_url, response_time, status, error_message, dynamic_weight, request_time)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      data.backend_url,
-      data.response_time,
-      data.status,
-      data.error_message || '',
-      data.dynamic_weight || 0,
-      data.request_time
-    ).run();
-    
-    logDebug('请求日志插入成功');
-    
-    // 清理旧的日志（保留最近100条）
-    await env.DB.prepare(`
-      DELETE FROM request_logs 
-      WHERE id NOT IN (
-        SELECT id FROM request_logs 
-        ORDER BY request_time DESC 
-        LIMIT 100
-      )
-    `).run();
-    
-    logDebug('清理旧日志完成');
-    
-  } catch (error) {
-    logError('记录请求日志时发生错误', error);
   }
 }
 
@@ -1452,7 +1473,7 @@ async function handleStatusPage(request, env, isInitialized) {
                 <i class="fas fa-balance-scale"></i>
                 订阅转换负载均衡系统
               </h1>
-              <p>智能加权轮询 | 实时监控 | 性能统计</p>
+              <p>基于最近20条请求成功率加权轮询 | 实时监控 | 性能统计</p>
             </div>
             <div class="action-buttons">
               <button class="btn btn-primary" onclick="refreshData()">
@@ -1671,7 +1692,7 @@ async function handleStatusPage(request, env, isInitialized) {
             <div class="info-item">
               <h3 style="color: var(--text-secondary); font-size: 14px; margin-bottom: 8px;">权重算法</h3>
               <p style="font-size: 16px; font-weight: 500;">
-                成功: +${SUCCESS_WEIGHT_INCREMENT}, 失败: -${FAILURE_WEIGHT_DECREMENT}
+                基于最近20条请求的成功率动态调整
               </p>
               <p style="font-size: 13px; color: var(--text-secondary);">
                 范围: ${MIN_WEIGHT} - ${MAX_WEIGHT}
