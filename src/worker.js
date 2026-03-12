@@ -36,12 +36,12 @@ function logError(message, error = null, reqId = null) {
 function getConfig(env) {
   return {
     INITIAL_WEIGHT: parseInt(env.INITIAL_WEIGHT) || 10,
-    MAX_WEIGHT: parseInt(env.MAX_WEIGHT) || 20,
+    MAX_WEIGHT: parseInt(env.MAX_WEIGHT) || 10,
     MIN_WEIGHT: parseInt(env.MIN_WEIGHT) || 1,
-    REQUEST_TIMEOUT: parseInt(env.REQUEST_TIMEOUT) || 10000,
-    MAX_LOG_ENTRIES: parseInt(env.MAX_LOG_ENTRIES) || 20,
+    REQUEST_TIMEOUT: parseInt(env.REQUEST_TIMEOUT) || 5000,
+    MAX_LOG_ENTRIES: parseInt(env.MAX_LOG_ENTRIES) || 50,
     CIRCUIT_BREAKER_THRESHOLD: parseInt(env.CIRCUIT_BREAKER_THRESHOLD) || 5,
-    CIRCUIT_BREAKER_TIMEOUT: parseInt(env.CIRCUIT_BREAKER_TIMEOUT) || 300, // 秒
+    CIRCUIT_BREAKER_TIMEOUT: parseInt(env.CIRCUIT_BREAKER_TIMEOUT) || 1800, // 秒
     HEALTH_CHECK_FAIL_THRESHOLD: parseInt(env.HEALTH_CHECK_FAIL_THRESHOLD) || 3,
     HEALTH_CHECK_URL: env.HEALTH_CHECK_URL || '/sub?target=clash&url=https://misub.vlato.site/getSub/e7d16b32-87cf-4d12-9096-800d8d043bc9', // 默认健康检查URL
     DEFAULT_BACKENDS: env.DEFAULT_BACKENDS ? JSON.parse(env.DEFAULT_BACKENDS) : [

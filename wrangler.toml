@@ -9,11 +9,11 @@ database_id = "a34f0c72-013c-4875-a814-1d5ccbd6279f"
 
 # 环境变量配置
 [vars]
-INITIAL_WEIGHT = "10"
-MAX_WEIGHT = "20"
-MIN_WEIGHT = "1"
-REQUEST_TIMEOUT = "5000"          # 毫秒
-MAX_LOG_ENTRIES = "20"             # 保留最近请求日志条数
+INITIAL_WEIGHT = "10"                 # 基础权重
+MAX_WEIGHT = "10"                   # 最大权重
+MIN_WEIGHT = "1"                     # 最小权重
+REQUEST_TIMEOUT = "5000"          # 超时时间(毫秒)
+MAX_LOG_ENTRIES = "50"             # 保留最近请求日志条数
 CIRCUIT_BREAKER_THRESHOLD = "5"    # 连续失败熔断阈值
 CIRCUIT_BREAKER_TIMEOUT = "1800"    # 熔断冷却时间（秒），默认30分钟
 HEALTH_CHECK_FAIL_THRESHOLD = "3"  # 健康检查连续失败阈值
