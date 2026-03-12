@@ -43,6 +43,7 @@ function getConfig(env) {
     CIRCUIT_BREAKER_THRESHOLD: parseInt(env.CIRCUIT_BREAKER_THRESHOLD) || 5,
     CIRCUIT_BREAKER_TIMEOUT: parseInt(env.CIRCUIT_BREAKER_TIMEOUT) || 300, // 秒
     HEALTH_CHECK_FAIL_THRESHOLD: parseInt(env.HEALTH_CHECK_FAIL_THRESHOLD) || 3,
+    HEALTH_CHECK_URL: env.HEALTH_CHECK_URL || '/sub?target=clash&url=https://misub.vlato.site/getSub/e7d16b32-87cf-4d12-9096-800d8d043bc9', // 默认健康检查URL
     DEFAULT_BACKENDS: env.DEFAULT_BACKENDS ? JSON.parse(env.DEFAULT_BACKENDS) : [
       'https://url.v1.mk',
       'https://subapi.cmliussss.net',
@@ -53,7 +54,7 @@ function getConfig(env) {
   };
 }
 
-// ---------- 数据库表结构定义（新增复合索引）----------
+// ---------- 数据库表结构定义 ----------
 const TABLE_SCHEMAS = {
   backend_servers: {
     columns: [
@@ -79,7 +80,7 @@ const TABLE_SCHEMAS = {
     ],
     indexes: [
       'CREATE INDEX IF NOT EXISTS idx_backend_servers_weight ON backend_servers(dynamic_weight DESC)',
-      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled, healthy, disabled_until)', // 复合索引
+      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled, healthy, disabled_until)',
       'CREATE INDEX IF NOT EXISTS idx_backend_servers_disabled ON backend_servers(disabled_until)'
     ]
   },
@@ -159,7 +160,7 @@ async function createDatabaseTables(env) {
   logInfo('数据库表创建完成');
 }
 
-// ---------- 智能权重计算（基于 EWMA + 连续失败惩罚）----------
+// ---------- 智能权重计算 ----------
 function computeDynamicWeight(baseWeight, ewma, avgResponseTime, consecutiveFailures, config) {
   const { INITIAL_WEIGHT, MAX_WEIGHT, MIN_WEIGHT } = config;
   const normRT = Math.max(0, 1 - Math.min(avgResponseTime / 3000, 1));
@@ -170,17 +171,15 @@ function computeDynamicWeight(baseWeight, ewma, avgResponseTime, consecutiveFail
   return weight;
 }
 
-// ---------- 被动健康检查触发 ----------
-async function triggerPassiveHealthCheck(env, backendId, backendUrl, config, reqId) {
+// ---------- 被动健康检查触发（使用请求的订阅地址）----------
+async function triggerPassiveHealthCheck(env, backendId, backendUrl, testUrl, config, reqId) {
   try {
-    logInfo(`触发被动健康检查: ${backendUrl}`, null, reqId);
-    const testUrl = '/sub?target=clash&url=https://www.google.com';
+    logInfo(`触发被动健康检查: ${backendUrl}`, { testUrl }, reqId);
     const start = Date.now();
     const res = await fetchWithTimeout(`${backendUrl}${testUrl}`, {}, config.REQUEST_TIMEOUT);
     const ok = res.ok;
     const responseTime = Date.now() - start;
     
-    // 更新健康状态
     await env.DB.prepare(`
       UPDATE backend_servers 
       SET healthy = ?, last_health_check = datetime('now'),
@@ -188,10 +187,9 @@ async function triggerPassiveHealthCheck(env, backendId, backendUrl, config, req
       WHERE id = ?
     `).bind(ok ? 1 : 0, ok ? 0 : 1, backendId).run();
     
-    logInfo(`被动健康检查完成: ${backendUrl} ${ok ? '通过' : '失败'}`, { responseTime }, reqId);
+    logInfo(`被动健康检查完成: ${backendUrl} ${ok ? '通过' : '失败'}`, { responseTime, testUrl }, reqId);
   } catch (error) {
     logError(`被动健康检查失败: ${backendUrl}`, error, reqId);
-    // 标记为不健康
     await env.DB.prepare(`
       UPDATE backend_servers 
       SET healthy = 0, last_health_check = datetime('now'),
@@ -201,8 +199,8 @@ async function triggerPassiveHealthCheck(env, backendId, backendUrl, config, req
   }
 }
 
-// ---------- 更新后端统计（EWMA、连续失败、动态权重、熔断）----------
-async function updateBackendStats(env, backendId, backendUrl, success, responseTime, config, reqId) {
+// ---------- 更新后端统计 ----------
+async function updateBackendStats(env, backendId, backendUrl, success, responseTime, config, reqId, testUrl = null) {
   const startTime = Date.now();
   try {
     const record = await env.DB.prepare(`
@@ -224,10 +222,8 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
     const currentSuccess = success ? 1 : 0;
     const ewma = alpha * currentSuccess + (1 - alpha) * (record.ewma_success_rate || 0.5);
 
-    // 连续失败计数
     let consecutiveFails = success ? 0 : (record.consecutive_failures || 0) + 1;
 
-    // 熔断逻辑
     let disabledUntil = record.disabled_until;
     const now = new Date();
     if (!success && consecutiveFails >= config.CIRCUIT_BREAKER_THRESHOLD) {
@@ -252,10 +248,9 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
     const dbTime = Date.now() - startTime;
     logDebug(`后端统计更新完成`, { backendId, dbTime, dynamicWeight }, reqId);
 
-    // 被动健康检查：如果连续失败达到阈值（如3次），触发主动探测
-    if (!success && consecutiveFails >= 3) {
-      // 异步触发健康检查，不等待
-      triggerPassiveHealthCheck(env, backendId, backendUrl, config, reqId).catch(e => 
+    // 被动健康检查：如果连续失败达到阈值（如3次），触发主动探测，使用传入的testUrl
+    if (!success && consecutiveFails >= 3 && testUrl) {
+      triggerPassiveHealthCheck(env, backendId, backendUrl, testUrl, config, reqId).catch(e => 
         logError('被动健康检查执行失败', e, reqId)
       );
     }
@@ -264,7 +259,7 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
   }
 }
 
-// ---------- 记录请求日志（异步，仅插入）----------
+// ---------- 记录请求日志 ----------
 async function logRequest(env, data, reqId) {
   const startTime = Date.now();
   try {
@@ -279,7 +274,7 @@ async function logRequest(env, data, reqId) {
   }
 }
 
-// ---------- 定时清理旧日志（独立任务）----------
+// ---------- 定时清理旧日志 ----------
 async function cleanupOldLogs(env, config, reqId = 'cleanup') {
   const startTime = Date.now();
   try {
@@ -297,7 +292,7 @@ async function cleanupOldLogs(env, config, reqId = 'cleanup') {
   }
 }
 
-// ---------- 选择后端（基于动态权重加权随机，排除熔断中的后端）----------
+// ---------- 选择后端 ----------
 async function selectBackend(env, config, excludeIds = [], reqId) {
   const startTime = Date.now();
   try {
@@ -347,7 +342,7 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-// ---------- 处理订阅请求（含重试机制、熔断、结构化日志）----------
+// ---------- 处理订阅请求 ----------
 async function handleSubscriptionRequest(request, env, ctx) {
   const reqId = generateRequestId();
   const config = getConfig(env);
@@ -373,7 +368,6 @@ async function handleSubscriptionRequest(request, env, ctx) {
     let response, errorMsg, status, statusCode;
 
     try {
-      // 精简请求头
       const headers = new Headers();
       const allowedHeaders = ['accept', 'accept-language', 'content-type', 'user-agent', 'authorization'];
       for (const [key, value] of request.headers.entries()) {
@@ -398,7 +392,7 @@ async function handleSubscriptionRequest(request, env, ctx) {
       status = isSuccess ? 'success' : 'failed';
       errorMsg = isSuccess ? '' : `HTTP ${statusCode}`;
 
-      // 异步记录日志和统计（并行执行）
+      // 异步记录日志和统计，传入当前请求的路径用于被动健康检查
       ctx.waitUntil((async () => {
         await Promise.all([
           logRequest(env, {
@@ -409,7 +403,7 @@ async function handleSubscriptionRequest(request, env, ctx) {
             dynamic_weight: backend.dynamic_weight,
             request_time: new Date().toISOString()
           }, reqId),
-          updateBackendStats(env, backend.id, backend.url, isSuccess, responseTime, config, reqId)
+          updateBackendStats(env, backend.id, backend.url, isSuccess, responseTime, config, reqId, url.pathname + url.search)
         ]);
       })());
 
@@ -466,7 +460,7 @@ async function handleSubscriptionRequest(request, env, ctx) {
             dynamic_weight: backend.dynamic_weight,
             request_time: new Date().toISOString()
           }, reqId),
-          updateBackendStats(env, backend.id, backend.url, false, responseTime, config, reqId)
+          updateBackendStats(env, backend.id, backend.url, false, responseTime, config, reqId, url.pathname + url.search)
         ]);
       })());
 
@@ -490,7 +484,7 @@ async function handleSubscriptionRequest(request, env, ctx) {
   });
 }
 
-// ---------- 处理版本请求（简化版）----------
+// ---------- 处理版本请求 ----------
 async function handleVersionRequest(request, env, ctx) {
   const reqId = generateRequestId();
   const config = getConfig(env);
@@ -516,7 +510,7 @@ async function handleVersionRequest(request, env, ctx) {
   return new Response('Version check failed', { status: 503 });
 }
 
-// ---------- 主动健康检查（定时任务，每30分钟）----------
+// ---------- 主动健康检查（定时任务，使用配置的测试URL）----------
 async function scheduledHealthCheck(env, config, ctx) {
   const reqId = 'healthcheck';
   logInfo('开始执行健康检查', null, reqId);
@@ -524,7 +518,7 @@ async function scheduledHealthCheck(env, config, ctx) {
     const backends = await env.DB.prepare(`SELECT id, url, health_check_failures FROM backend_servers WHERE enabled = 1`).all();
     if (!backends.results) return;
 
-    const testUrl = '/sub?target=clash&url=https://www.google.com';
+    const testUrl = config.HEALTH_CHECK_URL; // 从环境变量读取
     for (const backend of backends.results) {
       try {
         const start = Date.now();
@@ -545,7 +539,7 @@ async function scheduledHealthCheck(env, config, ctx) {
           WHERE id = ?
         `).bind(healthy ? 1 : 0, healthFailures, backend.id).run();
         logDebug(`健康检查 ${backend.url}: ${ok ? '通过' : '失败'} (连续失败 ${healthFailures})`, 
-          { responseTime }, reqId);
+          { responseTime, testUrl }, reqId);
       } catch (e) {
         let healthFailures = (backend.health_check_failures || 0) + 1;
         const healthy = healthFailures < config.HEALTH_CHECK_FAIL_THRESHOLD;
@@ -640,7 +634,7 @@ async function handleInitDatabase(request, env) {
   }
 }
 
-// ---------- 页面处理：状态页面（已适配移动端卡片和地址换行）----------
+// ---------- 页面处理：状态页面（移动端地址横向滚动）----------
 async function handleStatusPage(request, env) {
   const config = getConfig(env);
   const reqId = generateRequestId();
@@ -660,7 +654,7 @@ async function handleStatusPage(request, env) {
   const backends = backendStats.value?.results || [];
   const requests = recentRequests.value?.results || [];
 
-  // 构造后端表格行（用于桌面端）和卡片数据（移动端）
+  // 构造后端表格行
   const backendRows = backends.map(b => {
     const total = b.total_requests || 0;
     const success = b.success_count || 0;
@@ -681,7 +675,7 @@ async function handleStatusPage(request, env) {
           ${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
           ${disabledUntil ? `<span class="status-badge status-failed">熔断至 ${disabledUntil}</span>` : ''}
         </div>
-        <div style="max-width:200px; overflow:hidden; text-overflow:ellipsis; word-break:break-all;">${b.url || '未知'}</div>
+        <div style="max-width:200px; overflow:hidden; text-overflow:ellipsis;">${b.url || '未知'}</div>
       </td>
       <td data-label="请求统计">
         <div><small>总请求: ${total}</small></div>
@@ -712,7 +706,7 @@ async function handleStatusPage(request, env) {
     return `<tr>
       <td data-label="后端地址">
         <div class="mobile-row"><strong>${r.backend_url || '未知'}</strong></div>
-        <div style="max-width:180px; overflow:hidden; text-overflow:ellipsis; word-break:break-all;">${r.backend_url || '未知'}</div>
+        <div style="max-width:180px; overflow:hidden; text-overflow:ellipsis;">${r.backend_url || '未知'}</div>
       </td>
       <td data-label="状态">
         <span class="status-badge ${statusClass}">${statusText}</span>
@@ -729,7 +723,7 @@ async function handleStatusPage(request, env) {
     </tr>`;
   }).join('');
 
-  // 移动端卡片 HTML
+  // 移动端卡片 HTML（地址横向滚动）
   const backendCards = backends.map(b => {
     const total = b.total_requests || 0;
     const success = b.success_count || 0;
@@ -744,7 +738,7 @@ async function handleStatusPage(request, env) {
 
     return `<div class="mobile-card">
       <div class="mobile-card-header">
-        <strong style="word-break:break-all;">${b.url || '未知'}</strong>
+        <strong class="mobile-card-address" title="${b.url || '未知'}">${b.url || '未知'}</strong>
         <span class="healthy-badge ${healthy ? 'healthy-true' : 'healthy-false'}">${healthy ? '健康' : '不健康'}</span>
       </div>
       <div class="mobile-card-body">
@@ -769,7 +763,7 @@ async function handleStatusPage(request, env) {
     const weightLevel = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
     return `<div class="mobile-card">
       <div class="mobile-card-header">
-        <strong style="word-break:break-all;">${r.backend_url || '未知'}</strong>
+        <strong class="mobile-card-address" title="${r.backend_url || '未知'}">${r.backend_url || '未知'}</strong>
         <span class="status-badge ${statusClass}">${statusText}</span>
       </div>
       <div class="mobile-card-body">
@@ -994,6 +988,14 @@ async function handleStatusPage(request, env) {
       margin-bottom: 10px;
       padding-bottom: 8px;
       border-bottom: 1px dashed var(--border-color);
+    }
+    .mobile-card-address {
+      white-space: nowrap;
+      overflow-x: auto;
+      display: block;
+      max-width: 70%;
+      font-weight: 600;
+      padding-bottom: 2px;
     }
     .mobile-card-body {
       display: grid;
@@ -1369,7 +1371,7 @@ async function handleStatusPage(request, env) {
                 \${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
                 \${disabledUntil ? '<span class="status-badge status-failed">熔断至 '+disabledUntil+'</span>' : ''}
               </div>
-              <div style="max-width:200px;overflow:hidden;text-overflow:ellipsis;word-break:break-all;">\${b.url || '未知'}</div>
+              <div style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">\${b.url || '未知'}</div>
             </td>
             <td data-label="请求统计">
               <div><small>总请求: \${total}</small></div>
@@ -1391,10 +1393,10 @@ async function handleStatusPage(request, env) {
             </td>
           </tr>\`;
 
-          // 卡片
+          // 卡片（地址横向滚动）
           cardsHtml += \`<div class="mobile-card">
             <div class="mobile-card-header">
-              <strong style="word-break:break-all;">\${b.url || '未知'}</strong>
+              <strong class="mobile-card-address" title="\${b.url || '未知'}">\${b.url || '未知'}</strong>
               <span class="healthy-badge \${healthy ? 'healthy-true' : 'healthy-false'}">\${healthy ? '健康' : '不健康'}</span>
             </div>
             <div class="mobile-card-body">
@@ -1442,7 +1444,7 @@ async function handleStatusPage(request, env) {
           const level = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
 
           tableHtml += \`<tr>
-            <td data-label="后端地址"><div class="mobile-row"><strong>\${r.backend_url || '未知'}</strong></div><div style="max-width:180px;overflow:hidden;text-overflow:ellipsis;word-break:break-all;">\${r.backend_url || '未知'}</div></td>
+            <td data-label="后端地址"><div class="mobile-row"><strong>\${r.backend_url || '未知'}</strong></div><div style="max-width:180px;overflow:hidden;text-overflow:ellipsis;">\${r.backend_url || '未知'}</div></td>
             <td data-label="状态"><span class="status-badge \${statusClass}">\${statusText}</span>\${r.error_message ? '<div><small style="color:#718096;font-size:11px;">'+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</small></div>' : ''}</td>
             <td data-label="动态权重"><div class="weight-info"><span class="weight-badge">\${weight.toFixed(1)}</span><div class="weight-label">\${level}权重</div></div></td>
             <td data-label="响应时间">\${formatResponseTime(r.response_time || 0)}</td>
@@ -1451,7 +1453,7 @@ async function handleStatusPage(request, env) {
 
           cardsHtml += \`<div class="mobile-card">
             <div class="mobile-card-header">
-              <strong style="word-break:break-all;">\${r.backend_url || '未知'}</strong>
+              <strong class="mobile-card-address" title="\${r.backend_url || '未知'}">\${r.backend_url || '未知'}</strong>
               <span class="status-badge \${statusClass}">\${statusText}</span>
             </div>
             <div class="mobile-card-body">
@@ -1501,7 +1503,7 @@ async function handleStatusPage(request, env) {
   });
 }
 
-// ---------- 页面处理：初始化页面（保持不变）----------
+// ---------- 页面处理：初始化页面 ----------
 async function handleInitPage(request, env) {
   const config = getConfig(env);
   const count = await env.DB.prepare('SELECT COUNT(*) as c FROM backend_servers').first();
