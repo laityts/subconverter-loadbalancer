@@ -1,24 +1,46 @@
 // Cloudflare Worker 主文件
-// 订阅转换负载均衡系统
+// 订阅转换负载均衡系统（优化版，修复构建错误）
 
-// 北京时区格式化
-const BEIJING_TIMEZONE = 'Asia/Shanghai';
+// ---------- 工具函数 ----------
+function logDebug(message, data = null) {
+  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const logMessage = `[DEBUG][${timestamp}] ${message}`;
+  if (data) console.log(logMessage, JSON.stringify(data, null, 2));
+  else console.log(logMessage);
+}
 
-// 默认后端地址
-const DEFAULT_BACKENDS = [
-  'https://url.v1.mk',
-  'https://subapi.cmliussss.net',
-  'https://subapi.sosoorg.com',
-  'https://subapi.fxxk.dedyn.io',
-  'https://subapi.zrfme.com'
-];
+function logError(message, error = null) {
+  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const errorMessage = `[ERROR][${timestamp}] ${message}`;
+  if (error) console.error(errorMessage, error.stack || error.message || error);
+  else console.error(errorMessage);
+}
 
-// 权重配置
-const INITIAL_WEIGHT = 10; // 初始权重
-const MAX_WEIGHT = 20;     // 最大权重
-const MIN_WEIGHT = 1;      // 最小权重
+function logInfo(message, data = null) {
+  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const infoMessage = `[INFO][${timestamp}] ${message}`;
+  if (data) console.log(infoMessage, JSON.stringify(data, null, 2));
+  else console.log(infoMessage);
+}
 
-// 数据库表结构定义
+// ---------- 配置读取（从环境变量）----------
+function getConfig(env) {
+  return {
+    INITIAL_WEIGHT: parseInt(env.INITIAL_WEIGHT) || 10,
+    MAX_WEIGHT: parseInt(env.MAX_WEIGHT) || 20,
+    MIN_WEIGHT: parseInt(env.MIN_WEIGHT) || 1,
+    REQUEST_TIMEOUT: parseInt(env.REQUEST_TIMEOUT) || 10000,
+    DEFAULT_BACKENDS: env.DEFAULT_BACKENDS ? JSON.parse(env.DEFAULT_BACKENDS) : [
+      'https://url.v1.mk',
+      'https://subapi.cmliussss.net',
+      'https://subapi.sosoorg.com',
+      'https://subapi.fxxk.dedyn.io',
+      'https://subapi.zrfme.com'
+    ],
+  };
+}
+
+// ---------- 数据库表结构定义 ----------
 const TABLE_SCHEMAS = {
   backend_servers: {
     columns: [
@@ -31,14 +53,18 @@ const TABLE_SCHEMAS = {
       { name: 'fail_count', type: 'INTEGER DEFAULT 0' },
       { name: 'average_response_time', type: 'REAL DEFAULT 0' },
       { name: 'last_response_time', type: 'REAL DEFAULT 0' },
+      { name: 'ewma_success_rate', type: 'REAL DEFAULT 0.5' },
+      { name: 'consecutive_failures', type: 'INTEGER DEFAULT 0' },
       { name: 'last_used', type: 'TIMESTAMP' },
       { name: 'enabled', type: 'BOOLEAN DEFAULT 1' },
+      { name: 'healthy', type: 'BOOLEAN DEFAULT 1' },
+      { name: 'last_health_check', type: 'TIMESTAMP' },
       { name: 'created_at', type: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
       { name: 'updated_at', type: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' }
     ],
     indexes: [
       'CREATE INDEX IF NOT EXISTS idx_backend_servers_weight ON backend_servers(dynamic_weight DESC)',
-      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled)'
+      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled, healthy)'
     ]
   },
   request_logs: {
@@ -59,3066 +85,1644 @@ const TABLE_SCHEMAS = {
   }
 };
 
-// 调试日志函数
-function logDebug(message, data = null) {
-  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-  const logMessage = `[DEBUG][${timestamp}] ${message}`;
-  if (data) {
-    console.log(logMessage, JSON.stringify(data, null, 2));
-  } else {
-    console.log(logMessage);
-  }
-}
-
-// 错误日志函数
-function logError(message, error = null) {
-  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-  const errorMessage = `[ERROR][${timestamp}] ${message}`;
-  if (error) {
-    console.error(errorMessage, error.stack || error.message || error);
-  } else {
-    console.error(errorMessage);
-  }
-}
-
-// 信息日志函数
-function logInfo(message, data = null) {
-  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-  const infoMessage = `[INFO][${timestamp}] ${message}`;
-  if (data) {
-    console.log(infoMessage, JSON.stringify(data, null, 2));
-  } else {
-    console.log(infoMessage);
-  }
-}
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-    
-    logInfo(`收到请求: ${request.method} ${url.pathname}${url.search}`);
-    logDebug('请求头信息:', Object.fromEntries(request.headers.entries()));
-    
-    // 处理 OPTIONS 预检请求（CORS）
-    if (request.method === 'OPTIONS') {
-      logInfo('处理 OPTIONS 预检请求');
-      return handleOptions(request);
-    }
-    
-    // 首先确保数据库已初始化
-    try {
-      await ensureDatabaseInitialized(env);
-      logInfo('数据库初始化检查完成');
-    } catch (error) {
-      logError('数据库初始化失败', error);
-      // 如果是状态页面，仍然返回HTML让用户能看到初始化按钮
-      if (pathname === '/status') {
-        logInfo('数据库未初始化，返回状态页面');
-        return handleStatusPage(request, env, false);
-      }
-      // 如果是初始化页面，允许访问
-      if (pathname === '/init' || pathname === '/api/init-db') {
-        logInfo('访问初始化相关页面，继续处理');
-        // 继续处理
-      } else {
-        // 其他页面重定向到初始化页面
-        logInfo(`数据库未初始化，重定向到初始化页面: ${url.origin}/init`);
-        return Response.redirect(`${url.origin}/init`, 302);
-      }
-    }
-    
-    // 路由处理
-    if (pathname === '/sub' || pathname.startsWith('/sub/')) {
-      logInfo('处理订阅转换请求');
-      return handleSubscriptionRequest(request, env);
-    } else if (pathname === '/version') {
-      logInfo('处理版本请求');
-      return handleVersionRequest(request, env);
-    } else if (pathname === '/status') {
-      logInfo('处理状态页面请求');
-      return handleStatusPage(request, env, true);
-    } else if (pathname === '/init') {
-      logInfo('处理初始化页面请求');
-      return handleInitPage(request, env);
-    } else if (pathname === '/api/init-db') {
-      logInfo('处理数据库初始化API请求');
-      return handleInitDatabase(request, env);
-    } else if (pathname === '/api/backend-stats') {
-      logInfo('处理后端统计API请求');
-      return handleBackendStats(request, env);
-    } else if (pathname === '/api/recent-requests') {
-      logInfo('处理最近请求API请求');
-      return handleRecentRequests(request, env);
-    } else if (pathname === '/') {
-      logInfo('根路径重定向到状态页面');
-      return Response.redirect(`${url.origin}/status`, 302);
-    } else {
-      logInfo(`其他路径转发到订阅转换: ${pathname}`);
-      return handleSubscriptionRequest(request, env);
-    }
-  }
-};
-
-// 处理 CORS 预检请求
-function handleOptions(request) {
-  const headers = request.headers;
-  return new Response(null, {
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': headers.get('Access-Control-Request-Headers') || '*',
-      'Access-Control-Max-Age': '86400',
-    },
-  });
-}
-
-// 检查表是否存在
+// ---------- 数据库初始化/升级辅助函数 ----------
 async function checkTableExists(env, tableName) {
-  try {
-    const result = await env.DB.prepare(`
-      SELECT name FROM sqlite_master 
-      WHERE type='table' AND name = ?
-    `).bind(tableName).first();
-    
-    return result !== null;
-  } catch (error) {
-    logError(`检查表 ${tableName} 是否存在时出错`, error);
-    return false;
-  }
+  const result = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`).bind(tableName).first();
+  return result !== null;
 }
 
-// 获取表的列信息
 async function getTableColumns(env, tableName) {
   try {
     const result = await env.DB.prepare(`PRAGMA table_info(${tableName})`).all();
-    
-    if (result.results) {
-      return result.results.map(col => ({
-        name: col.name,
-        type: col.type,
-        notnull: col.notnull,
-        dflt_value: col.dflt_value,
-        pk: col.pk
-      }));
-    }
-    return [];
-  } catch (error) {
-    logError(`获取表 ${tableName} 列信息时出错`, error);
+    return result.results ? result.results.map(col => ({ name: col.name, type: col.type })) : [];
+  } catch {
     return [];
   }
 }
 
-// 更新表结构，添加缺失的列
 async function updateTableSchema(env, tableName) {
-  logDebug(`开始更新表结构: ${tableName}`);
-  
-  if (!TABLE_SCHEMAS[tableName]) {
-    logError(`未找到表 ${tableName} 的结构定义`);
-    return false;
-  }
-  
-  try {
-    // 获取现有列
-    const existingColumns = await getTableColumns(env, tableName);
-    const existingColumnNames = existingColumns.map(col => col.name.toLowerCase());
-    
-    logDebug(`表 ${tableName} 现有列:`, existingColumnNames);
-    
-    // 检查并添加缺失的列
-    const schemaColumns = TABLE_SCHEMAS[tableName].columns;
-    let columnsAdded = 0;
-    
-    for (const columnDef of schemaColumns) {
-      const columnName = columnDef.name.toLowerCase();
-      
-      if (!existingColumnNames.includes(columnName)) {
-        // 列不存在，需要添加
-        logInfo(`表 ${tableName} 添加缺失列: ${columnDef.name} (${columnDef.type})`);
-        
-        try {
-          await env.DB.prepare(`
-            ALTER TABLE ${tableName} 
-            ADD COLUMN ${columnDef.name} ${columnDef.type}
-          `).run();
-          
-          columnsAdded++;
-          logDebug(`列 ${columnDef.name} 添加成功`);
-        } catch (addError) {
-          logError(`添加列 ${columnDef.name} 失败`, addError);
-        }
-      }
-    }
-    
-    // 创建索引（如果不存在）
-    const indexes = TABLE_SCHEMAS[tableName].indexes || [];
-    for (const indexSQL of indexes) {
+  if (!TABLE_SCHEMAS[tableName]) return false;
+  const existingColumns = await getTableColumns(env, tableName);
+  const existingNames = existingColumns.map(c => c.name.toLowerCase());
+  const schemaColumns = TABLE_SCHEMAS[tableName].columns;
+  for (const col of schemaColumns) {
+    if (!existingNames.includes(col.name.toLowerCase())) {
       try {
-        await env.DB.prepare(indexSQL).run();
-        logDebug(`表 ${tableName} 索引创建/检查完成: ${indexSQL.substring(0, 50)}...`);
-      } catch (indexError) {
-        logError(`创建索引失败: ${indexSQL.substring(0, 50)}...`, indexError);
+        await env.DB.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${col.name} ${col.type}`).run();
+        logInfo(`表 ${tableName} 添加列: ${col.name}`);
+      } catch (e) {
+        logError(`添加列 ${col.name} 失败`, e);
       }
     }
-    
-    if (columnsAdded > 0) {
-      logInfo(`表 ${tableName} 结构更新完成，添加了 ${columnsAdded} 个列`);
-    } else {
-      logDebug(`表 ${tableName} 结构已是最新`);
-    }
-    
-    return true;
-  } catch (error) {
-    logError(`更新表 ${tableName} 结构时出错`, error);
-    return false;
   }
+  for (const idx of TABLE_SCHEMAS[tableName].indexes || []) {
+    try { await env.DB.prepare(idx).run(); } catch (e) { logError(`创建索引失败`, e); }
+  }
+  return true;
 }
 
-// 确保数据库已初始化
 async function ensureDatabaseInitialized(env) {
-  logDebug('开始检查数据库初始化状态');
-  try {
-    // 检查表是否存在
-    const backendTableExists = await checkTableExists(env, 'backend_servers');
-    const logsTableExists = await checkTableExists(env, 'request_logs');
-    
-    logDebug(`表存在状态: backend_servers=${backendTableExists}, request_logs=${logsTableExists}`);
-    
-    // 如果表不存在，创建它们
-    if (!backendTableExists || !logsTableExists) {
-      logInfo('数据库表不存在或部分缺失，开始创建表');
-      await createDatabaseTables(env);
-      logInfo('数据库表创建完成');
-    } else {
-      logDebug('数据库表已存在，检查表结构更新');
-      
-      // 更新表结构
-      await updateTableSchema(env, 'backend_servers');
-      await updateTableSchema(env, 'request_logs');
-    }
-    
-    return true;
-  } catch (error) {
-    logError('检查数据库初始化状态失败', error);
-    throw error;
+  const backendExists = await checkTableExists(env, 'backend_servers');
+  const logsExists = await checkTableExists(env, 'request_logs');
+  if (!backendExists || !logsExists) {
+    await createDatabaseTables(env);
+  } else {
+    await updateTableSchema(env, 'backend_servers');
+    await updateTableSchema(env, 'request_logs');
   }
+  return true;
 }
 
-// 创建数据库表
 async function createDatabaseTables(env) {
-  try {
-    logDebug('开始创建数据库表');
-    
-    // 创建后端服务器表
-    const backendColumns = TABLE_SCHEMAS.backend_servers.columns
-      .map(col => `${col.name} ${col.type}`)
-      .join(',\n      ');
-    
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS backend_servers (
-        ${backendColumns}
-      )
-    `).run();
-    
-    logDebug('后端服务器表创建成功');
-    
-    // 创建请求日志表
-    const logsColumns = TABLE_SCHEMAS.request_logs.columns
-      .map(col => `${col.name} ${col.type}`)
-      .join(',\n      ');
-    
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS request_logs (
-        ${logsColumns}
-      )
-    `).run();
-    
-    logDebug('请求日志表创建成功');
-    
-    // 创建索引
-    for (const indexSQL of TABLE_SCHEMAS.backend_servers.indexes) {
-      await env.DB.prepare(indexSQL).run();
-    }
-    
-    for (const indexSQL of TABLE_SCHEMAS.request_logs.indexes) {
-      await env.DB.prepare(indexSQL).run();
-    }
-    
-    logDebug('数据库索引创建成功');
-    logInfo('数据库表创建完成');
-    return true;
-  } catch (error) {
-    logError('创建数据库表失败', error);
-    throw error;
-  }
+  const backendCols = TABLE_SCHEMAS.backend_servers.columns.map(c => `${c.name} ${c.type}`).join(',\n');
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS backend_servers (${backendCols})`).run();
+  const logsCols = TABLE_SCHEMAS.request_logs.columns.map(c => `${c.name} ${c.type}`).join(',\n');
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS request_logs (${logsCols})`).run();
+  for (const idx of TABLE_SCHEMAS.backend_servers.indexes) await env.DB.prepare(idx).run();
+  for (const idx of TABLE_SCHEMAS.request_logs.indexes) await env.DB.prepare(idx).run();
+  logInfo('数据库表创建完成');
 }
 
-// ---------- 基于最近20条请求计算权重 ----------
-async function computeBackendWeight(env, backendUrl) {
-  try {
-    // 查询最近20条请求日志
-    const logs = await env.DB.prepare(`
-      SELECT status FROM request_logs
-      WHERE backend_url = ?
-      ORDER BY request_time DESC
-      LIMIT 20
-    `).bind(backendUrl).all();
-    
-    const records = logs.results || [];
-    const total = records.length;
-    if (total === 0) {
-      return INITIAL_WEIGHT; // 默认权重10
-    }
-    
-    const successCount = records.filter(r => r.status === 'success').length;
-    const successRate = successCount / total;
-    // 权重映射到1-20
-    let weight = Math.max(MIN_WEIGHT, Math.min(MAX_WEIGHT, Math.round(successRate * MAX_WEIGHT)));
-    return weight;
-  } catch (error) {
-    logError(`计算后端权重失败: url=${backendUrl}`, error);
-    return INITIAL_WEIGHT;
-  }
+// ---------- 智能权重计算（基于 EWMA + 连续失败惩罚）----------
+function computeDynamicWeight(baseWeight, ewma, avgResponseTime, consecutiveFailures, config) {
+  const { INITIAL_WEIGHT, MAX_WEIGHT, MIN_WEIGHT } = config;
+  const normRT = Math.max(0, 1 - Math.min(avgResponseTime / 3000, 1));
+  const penalty = Math.exp(-consecutiveFailures);
+  const factor = 0.6 * ewma + 0.2 * normRT + 0.2 * penalty;
+  let weight = Math.round(baseWeight * factor);
+  weight = Math.max(MIN_WEIGHT, Math.min(MAX_WEIGHT, weight));
+  return weight;
 }
 
-// 智能选择后端（基于最近20条成功率加权轮询）
-async function selectBackend(env) {
-  logDebug('开始选择后端（基于最近20条请求成功率）');
+// ---------- 更新后端统计（EWMA、连续失败、动态权重）----------
+async function updateBackendStats(env, backendId, backendUrl, success, responseTime, config) {
   try {
-    // 获取所有启用的后端
-    const result = await env.DB.prepare(`
-      SELECT id, url, weight
-      FROM backend_servers
-      WHERE enabled = 1
-    `).all();
-    
-    if (!result.results || result.results.length === 0) {
-      logError('数据库中没有启用的后端服务器');
-      return null;
-    }
-    
-    const backends = result.results;
-    logInfo(`找到 ${backends.length} 个启用的后端服务器，正在计算权重...`);
-    
-    // 为每个后端计算权重（基于最近20条成功率）
-    const weightedBackends = [];
-    for (const backend of backends) {
-      const weight = await computeBackendWeight(env, backend.url);
-      weightedBackends.push({
-        ...backend,
-        dynamic_weight: weight // 临时存储权重
-      });
-    }
-    
-    // 计算总权重
-    let totalWeight = 0;
-    for (const b of weightedBackends) {
-      totalWeight += b.dynamic_weight;
-    }
-    
-    if (totalWeight === 0) {
-      // 如果所有权重都是0（不太可能），使用基础权重
-      logDebug('总权重为0，使用基础权重');
-      for (const b of weightedBackends) {
-        b.dynamic_weight = b.weight || INITIAL_WEIGHT;
-        totalWeight += b.dynamic_weight;
-      }
-    }
-    
-    // 加权随机选择
-    let random = Math.random() * totalWeight;
-    let selectedBackend = null;
-    for (const backend of weightedBackends) {
-      random -= backend.dynamic_weight;
-      if (random <= 0) {
-        selectedBackend = backend;
-        break;
-      }
-    }
-    
-    if (!selectedBackend) {
-      selectedBackend = weightedBackends[0];
-    }
-    
-    logInfo(`选择了后端: ${selectedBackend.url}, 计算权重: ${selectedBackend.dynamic_weight}`);
-    return selectedBackend;
-    
-  } catch (error) {
-    logError('选择后端时发生错误', error);
-    return null;
-  }
-}
-
-// 更新后端统计信息（包括基于最近成功率的动态权重）
-async function updateBackendStats(env, backendId, backendUrl, success, responseTime) {
-  logDebug(`更新后端统计: id=${backendId}, url=${backendUrl}, success=${success}, responseTime=${responseTime}ms`);
-  try {
-    // 获取当前统计信息
-    const result = await env.DB.prepare(`
-      SELECT total_requests, success_count, fail_count, average_response_time, weight
-      FROM backend_servers
-      WHERE id = ?
+    const record = await env.DB.prepare(`
+      SELECT total_requests, success_count, fail_count, average_response_time,
+             weight, ewma_success_rate, consecutive_failures
+      FROM backend_servers WHERE id = ?
     `).bind(backendId).first();
-    
-    if (!result) {
-      logError(`找不到后端ID: ${backendId}`);
-      return;
-    }
-    
-    logDebug('当前后端统计:', result);
-    
-    // 计算新的统计数据
-    const totalRequests = result.total_requests + 1;
-    const successCount = result.success_count + (success ? 1 : 0);
-    const failCount = result.fail_count + (success ? 0 : 1);
-    
-    // 计算新的平均响应时间
-    let avgResponseTime;
-    if (result.total_requests === 0) {
-      avgResponseTime = responseTime;
-    } else {
-      avgResponseTime = (result.average_response_time * result.total_requests + responseTime) / totalRequests;
-    }
-    
-    // 基于最近20条请求重新计算动态权重（此时新日志已插入）
-    const newDynamicWeight = await computeBackendWeight(env, backendUrl);
-    logDebug(`重新计算动态权重: ${newDynamicWeight}`);
-    
-    // 更新数据库
+    if (!record) return;
+
+    const total = record.total_requests + 1;
+    const successCount = record.success_count + (success ? 1 : 0);
+    const failCount = record.fail_count + (success ? 0 : 1);
+
+    let avgRT;
+    if (record.total_requests === 0) avgRT = responseTime;
+    else avgRT = (record.average_response_time * record.total_requests + responseTime) / total;
+
+    const alpha = 0.3;
+    const currentSuccess = success ? 1 : 0;
+    const ewma = alpha * currentSuccess + (1 - alpha) * (record.ewma_success_rate || 0.5);
+
+    const consecutiveFails = success ? 0 : (record.consecutive_failures || 0) + 1;
+
+    const baseWeight = record.weight || config.INITIAL_WEIGHT;
+    const dynamicWeight = computeDynamicWeight(baseWeight, ewma, avgRT, consecutiveFails, config);
+
     await env.DB.prepare(`
       UPDATE backend_servers 
-      SET total_requests = ?, 
-          success_count = ?, 
-          fail_count = ?, 
-          average_response_time = ?,
-          last_response_time = ?,
-          dynamic_weight = ?,
-          last_used = datetime('now')
+      SET total_requests = ?, success_count = ?, fail_count = ?,
+          average_response_time = ?, last_response_time = ?,
+          ewma_success_rate = ?, consecutive_failures = ?,
+          dynamic_weight = ?, last_used = datetime('now')
       WHERE id = ?
-    `).bind(
-      totalRequests,
-      successCount,
-      failCount,
-      avgResponseTime,
-      responseTime,
-      newDynamicWeight,
-      backendId
-    ).run();
-    
-    logInfo(`后端统计更新完成: id=${backendId}, 总请求=${totalRequests}, 成功=${successCount}, 失败=${failCount}, 平均响应=${avgResponseTime.toFixed(2)}ms, 动态权重=${newDynamicWeight}`);
-    
+    `).bind(total, successCount, failCount, avgRT, responseTime,
+            ewma, consecutiveFails, dynamicWeight, backendId).run();
+
+    logDebug(`后端统计更新: id=${backendId}, 新动态权重=${dynamicWeight}`);
   } catch (error) {
-    logError('更新后端统计时发生错误', error);
+    logError(`更新后端统计失败: id=${backendId}`, error);
   }
 }
 
-// 记录请求日志
+// ---------- 记录请求日志（异步）----------
 async function logRequest(env, data) {
-  logDebug('记录请求日志:', data);
   try {
     await env.DB.prepare(`
       INSERT INTO request_logs (backend_url, response_time, status, error_message, dynamic_weight, request_time)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      data.backend_url,
-      data.response_time,
-      data.status,
-      data.error_message || '',
-      data.dynamic_weight || 0,
-      data.request_time
-    ).run();
-    
-    logDebug('请求日志插入成功');
-    
-    // 清理旧的日志（保留最近100条）
+    `).bind(data.backend_url, data.response_time, data.status,
+            data.error_message || '', data.dynamic_weight || 0, data.request_time).run();
+
     await env.DB.prepare(`
       DELETE FROM request_logs 
-      WHERE id NOT IN (
-        SELECT id FROM request_logs 
-        ORDER BY request_time DESC 
-        LIMIT 100
-      )
+      WHERE id NOT IN (SELECT id FROM request_logs ORDER BY request_time DESC LIMIT 100)
     `).run();
-    
-    logDebug('清理旧日志完成');
-    
   } catch (error) {
-    logError('记录请求日志时发生错误', error);
+    logError('记录请求日志失败', error);
   }
 }
 
-// 处理订阅转换请求
-async function handleSubscriptionRequest(request, env) {
-  logDebug('开始处理订阅转换请求');
+// ---------- 选择后端（基于动态权重加权随机）----------
+async function selectBackend(env, config, excludeIds = []) {
   try {
-    // 获取后端列表并智能选择
-    const backend = await selectBackend(env);
-    logDebug('选择的后端:', backend);
-    
-    if (!backend) {
-      logError('没有可用的后端服务器');
-      return new Response('No available backend servers', { 
-        status: 503,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Content-Type': 'text/plain; charset=utf-8'
-        }
-      });
+    let query = `SELECT id, url, dynamic_weight FROM backend_servers WHERE enabled = 1 AND healthy = 1`;
+    const params = [];
+    if (excludeIds.length > 0) {
+      query += ` AND id NOT IN (${excludeIds.map(() => '?').join(',')})`;
+      params.push(...excludeIds);
     }
-    
-    // 构建转发URL
-    const originalUrl = new URL(request.url);
-    const backendUrl = `${backend.url}${originalUrl.pathname}${originalUrl.search}`;
-    logInfo(`转发请求到后端: ${backendUrl}`);
-    
-    // 记录开始时间
+    const result = await env.DB.prepare(query).bind(...params).all();
+    const backends = result.results || [];
+    if (backends.length === 0) return null;
+
+    let totalWeight = backends.reduce((sum, b) => sum + (b.dynamic_weight || config.INITIAL_WEIGHT), 0);
+    let rand = Math.random() * totalWeight;
+    for (const b of backends) {
+      rand -= (b.dynamic_weight || config.INITIAL_WEIGHT);
+      if (rand <= 0) return b;
+    }
+    return backends[0];
+  } catch (error) {
+    logError('选择后端失败', error);
+    return null;
+  }
+}
+
+// ---------- 带超时的 fetch ----------
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
+}
+
+// ---------- 处理订阅请求（含重试机制）----------
+async function handleSubscriptionRequest(request, env, ctx) {
+  const config = getConfig(env);
+  const url = new URL(request.url);
+  const maxRetries = 3;
+  const triedIds = new Set();
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const backend = await selectBackend(env, config, Array.from(triedIds));
+    if (!backend) {
+      logError(`第${attempt}次尝试: 无可用后端`);
+      break;
+    }
+    triedIds.add(backend.id);
+
+    const backendUrl = `${backend.url}${url.pathname}${url.search}`;
     const startTime = Date.now();
-    
-    // 准备转发请求
-    const forwardRequest = new Request(backendUrl, {
-      method: request.method,
-      headers: request.headers,
-      body: request.body,
-      redirect: 'manual'
-    });
-    
-    let response;
-    let status = 'success';
-    let errorMsg = '';
-    let responseTime = 0;
-    
+    let response, errorMsg, status;
+
     try {
-      // 转发请求
-      logDebug('开始转发请求到后端');
-      response = await fetch(forwardRequest);
-      responseTime = Date.now() - startTime;
-      logInfo(`后端响应时间: ${responseTime}ms, 状态码: ${response.status}`);
-      
-      // 检查响应状态
-      if (!response.ok) {
-        status = 'failed';
-        errorMsg = `HTTP ${response.status}: ${response.statusText}`;
-        logError(`后端响应失败: ${errorMsg}`);
+      const forwardReq = new Request(backendUrl, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+        redirect: 'manual'
+      });
+      response = await fetchWithTimeout(forwardReq, {}, config.REQUEST_TIMEOUT);
+      const responseTime = Date.now() - startTime;
+      status = response.ok ? 'success' : 'failed';
+      errorMsg = response.ok ? '' : `HTTP ${response.status}`;
+
+      ctx.waitUntil((async () => {
+        await logRequest(env, {
+          backend_url: backend.url,
+          response_time: responseTime,
+          status: status,
+          error_message: errorMsg,
+          dynamic_weight: backend.dynamic_weight,
+          request_time: new Date().toISOString()
+        });
+        await updateBackendStats(env, backend.id, backend.url, status === 'success', responseTime, config);
+      })());
+
+      if (response.ok) {
+        const headers = new Headers(response.headers);
+        headers.set('Access-Control-Allow-Origin', '*');
+        headers.set('Cache-Control', 'no-store');
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers
+        });
       } else {
-        logInfo('后端响应成功');
+        logInfo(`后端 ${backend.url} 返回错误 ${response.status}，尝试重试 (${attempt}/${maxRetries})`);
       }
-      
-      // 获取当前动态权重（用于日志）
-      const currentDynamicWeight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
-      
-      // 先记录请求日志（包含本次请求，以便后续权重计算使用）
-      await logRequest(env, {
-        backend_url: backend.url,
-        response_time: responseTime,
-        status: status,
-        error_message: errorMsg,
-        dynamic_weight: currentDynamicWeight, // 记录请求时的动态权重
-        request_time: new Date().toISOString()
-      });
-      
-      // 更新后端统计信息（基于最新日志重新计算权重）
-      await updateBackendStats(env, backend.id, backend.url, status === 'success', responseTime);
-      
-      // 创建新的响应头（避免缓存）
-      const headers = new Headers(response.headers);
-      headers.set('Access-Control-Allow-Origin', '*');
-      headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-      headers.set('Pragma', 'no-cache');
-      headers.set('Expires', '0');
-      
-      logInfo('请求处理完成，返回响应');
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: headers
-      });
-      
     } catch (error) {
-      responseTime = Date.now() - startTime;
+      const responseTime = Date.now() - startTime;
       status = 'failed';
-      errorMsg = error.message;
-      logError('请求后端时发生错误', error);
-      
-      // 获取当前动态权重
-      const currentDynamicWeight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
-      
-      // 先记录请求日志
-      await logRequest(env, {
-        backend_url: backend.url,
-        response_time: responseTime,
-        status: status,
-        error_message: errorMsg,
-        dynamic_weight: currentDynamicWeight,
-        request_time: new Date().toISOString()
-      });
-      
-      // 更新后端统计信息（失败）
-      await updateBackendStats(env, backend.id, backend.url, false, responseTime);
-      
-      return new Response(`Backend error: ${error.message}`, {
-        status: 502,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Content-Type': 'text/plain; charset=utf-8'
-        }
-      });
-    }
-    
-  } catch (error) {
-    logError('处理订阅请求时发生内部错误', error);
-    return new Response(`Internal error: ${error.message}`, {
-      status: 500,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Content-Type': 'text/plain; charset=utf-8'
-      }
-    });
-  }
-}
+      errorMsg = error.name === 'AbortError' ? 'Timeout' : error.message;
 
-// 处理版本请求
-async function handleVersionRequest(request, env) {
-  logDebug('开始处理版本请求');
-  try {
-    // 选择后端
-    const backend = await selectBackend(env);
-    if (!backend) {
-      logError('没有可用的后端服务器用于版本检查');
-      return new Response('No available backend servers', { status: 503 });
-    }
-    
-    logInfo(`检查后端版本: ${backend.url}`);
-    
-    // 获取版本信息
-    const versionUrl = `${backend.url}/version`;
-    const response = await fetch(versionUrl, {
-      headers: {
-        'User-Agent': 'subconverter-loadbalancer/1.0'
-      }
-    });
-    
-    if (!response.ok) {
-      logError(`后端版本检查失败: ${response.status}`);
-      return new Response(`Backend version check failed: ${response.status}`, {
-        status: response.status
-      });
-    }
-    
-    const versionText = await response.text();
-    logInfo(`后端版本: ${versionText.substring(0, 100)}...`);
-    
-    return new Response(versionText, {
-      headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-    
-  } catch (error) {
-    logError('版本检查错误', error);
-    return new Response(`Version check error: ${error.message}`, {
-      status: 500,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Content-Type': 'text/plain; charset=utf-8'
-      }
-    });
-  }
-}
-
-// API: 获取后端统计
-async function handleBackendStats(request, env) {
-  logDebug('开始获取后端统计');
-  try {
-    // 添加时间戳避免缓存
-    const startTime = Date.now();
-    
-    const result = await env.DB.prepare(`
-      SELECT 
-        id, url, weight, dynamic_weight,
-        total_requests, success_count, fail_count,
-        average_response_time, last_response_time,
-        last_used, enabled,
-        created_at
-      FROM backend_servers
-      ORDER BY dynamic_weight DESC
-    `).all();
-    
-    const endTime = Date.now();
-    logDebug(`获取后端统计成功: 找到${result.results?.length || 0}条记录, 耗时${endTime - startTime}ms`);
-    
-    // 确保返回的是数组
-    const data = result.results || [];
-    
-    // 格式化数据，确保所有字段都有值
-    const formattedData = data.map(backend => ({
-      id: backend.id || 0,
-      url: backend.url || '未知',
-      weight: backend.weight || INITIAL_WEIGHT,
-      dynamic_weight: backend.dynamic_weight || backend.weight || INITIAL_WEIGHT,
-      total_requests: backend.total_requests || 0,
-      success_count: backend.success_count || 0,
-      fail_count: backend.fail_count || 0,
-      average_response_time: backend.average_response_time || 0,
-      last_response_time: backend.last_response_time || 0,
-      last_used: backend.last_used || null,
-      enabled: backend.enabled !== undefined ? backend.enabled : 1,
-      created_at: backend.created_at || new Date().toISOString()
-    }));
-    
-    return new Response(JSON.stringify(formattedData), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-        'Pragma': 'no-cache',
-        'Expires': '0'
-      }
-    });
-    
-  } catch (error) {
-    logError('获取后端统计时发生错误', error);
-    return new Response(JSON.stringify({
-      error: error.message,
-      stack: error.stack,
-      timestamp: new Date().toISOString()
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store'
-      }
-    });
-  }
-}
-
-// API: 获取最近请求
-async function handleRecentRequests(request, env) {
-  logDebug('开始获取最近请求');
-  try {
-    const result = await env.DB.prepare(`
-      SELECT 
-        id, backend_url, response_time, status, error_message, dynamic_weight, request_time,
-        created_at
-      FROM request_logs
-      ORDER BY request_time DESC
-      LIMIT 20
-    `).all();
-    
-    logDebug(`获取最近请求成功: 找到${result.results?.length || 0}条记录`);
-    
-    // 确保返回的是数组
-    const data = result.results || [];
-    
-    // 格式化数据
-    const formattedData = data.map(log => ({
-      id: log.id || 0,
-      backend_url: log.backend_url || '未知',
-      response_time: log.response_time || 0,
-      status: log.status || 'unknown',
-      error_message: log.error_message || '',
-      dynamic_weight: log.dynamic_weight || 0, // 包含动态权重
-      request_time: log.request_time || new Date().toISOString(),
-      created_at: log.created_at || new Date().toISOString()
-    }));
-    
-    return new Response(JSON.stringify(formattedData), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
-      }
-    });
-    
-  } catch (error) {
-    logError('获取最近请求时发生错误', error);
-    return new Response(JSON.stringify({
-      error: error.message,
-      stack: error.stack,
-      timestamp: new Date().toISOString()
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store'
-      }
-    });
-  }
-}
-
-// 状态页面
-async function handleStatusPage(request, env, isInitialized) {
-  logInfo('处理状态页面请求');
-  
-  // 首先确保数据库已初始化
-  if (!isInitialized) {
-    try {
-      await ensureDatabaseInitialized(env);
-      isInitialized = true;
-    } catch (error) {
-      // 如果初始化失败，跳转到初始化页面
-      logError('状态页面: 数据库初始化失败', error);
-      return Response.redirect(`${new URL(request.url).origin}/init`, 302);
-    }
-  }
-  
-  // 获取数据用于初始渲染（避免完全依赖客户端JavaScript）
-  let backendStats = [];
-  let recentRequests = [];
-  
-  try {
-    const statsResult = await env.DB.prepare(`
-      SELECT 
-        id, url, weight, dynamic_weight,
-        total_requests, success_count, fail_count,
-        average_response_time, last_response_time,
-        last_used, enabled
-      FROM backend_servers
-      ORDER BY dynamic_weight DESC
-      LIMIT 10
-    `).all();
-    
-    backendStats = statsResult.results || [];
-    
-    const logsResult = await env.DB.prepare(`
-      SELECT 
-        backend_url, response_time, status, error_message, dynamic_weight, request_time
-      FROM request_logs
-      ORDER BY request_time DESC
-      LIMIT 10
-    `).all();
-    
-    recentRequests = logsResult.results || [];
-  } catch (error) {
-    logError('获取状态页面初始数据失败', error);
-    // 继续渲染页面，客户端JavaScript会重新加载
-  }
-  
-  // 美化后的HTML
-  const html = `
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>订阅转换负载均衡 - 状态监控</title>
-      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-      <style>
-        :root {
-          --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          --secondary-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-          --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-          --card-bg: rgba(255, 255, 255, 0.95);
-          --text-primary: #2d3748;
-          --text-secondary: #718096;
-          --border-color: #e2e8f0;
-          --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.1);
-          --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
-          --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.1);
-          --radius-md: 12px;
-          --radius-lg: 16px;
-          --weight-gradient: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); /* 权重显示渐变色 */
-        }
-        
-        * {
-          margin: 0;
-          padding: 0;
-          box-sizing: border-box;
-        }
-        
-        body {
-          font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-          background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-          min-height: 100vh;
-          color: var(--text-primary);
-          line-height: 1.6;
-          padding: 20px;
-        }
-        
-        .container {
-          max-width: 1400px;
-          margin: 0 auto;
-        }
-        
-        /* 头部样式 */
-        .header {
-          background: var(--card-bg);
-          border-radius: var(--radius-lg);
-          padding: 30px;
-          margin-bottom: 30px;
-          box-shadow: var(--shadow-lg);
-          backdrop-filter: blur(10px);
-          border: 1px solid rgba(255, 255, 255, 0.2);
-        }
-        
-        .header-content {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          flex-wrap: wrap;
-          gap: 20px;
-        }
-        
-        .title-section h1 {
-          font-size: 28px;
-          font-weight: 700;
-          background: var(--primary-gradient);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-          margin-bottom: 8px;
-        }
-        
-        .title-section p {
-          color: var(--text-secondary);
-          font-size: 16px;
-        }
-        
-        .badge {
-          display: inline-block;
-          padding: 4px 12px;
-          background: var(--success-gradient);
-          color: white;
-          border-radius: 20px;
-          font-size: 14px;
-          font-weight: 600;
-          margin-left: 10px;
-        }
-        
-        /* 按钮组 */
-        .action-buttons {
-          display: flex;
-          gap: 12px;
-          flex-wrap: wrap;
-        }
-        
-        .btn {
-          padding: 12px 24px;
-          border: none;
-          border-radius: 8px;
-          font-size: 14px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.3s ease;
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          text-decoration: none;
-        }
-        
-        .btn-primary {
-          background: var(--primary-gradient);
-          color: white;
-        }
-        
-        .btn-primary:hover {
-          transform: translateY(-2px);
-          box-shadow: var(--shadow-md);
-        }
-        
-        .btn-secondary {
-          background: white;
-          color: var(--text-primary);
-          border: 1px solid var(--border-color);
-        }
-        
-        .btn-secondary:hover {
-          background: #f7fafc;
-          transform: translateY(-2px);
-          box-shadow: var(--shadow-md);
-        }
-        
-        /* 统计卡片网格 */
-        .stats-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-          gap: 25px;
-          margin-bottom: 30px;
-        }
-        
-        @media (max-width: 768px) {
-          .stats-grid {
-            grid-template-columns: 1fr;
-          }
-        }
-        
-        /* 卡片样式 */
-        .card {
-          background: var(--card-bg);
-          border-radius: var(--radius-lg);
-          padding: 30px;
-          box-shadow: var(--shadow-lg);
-          backdrop-filter: blur(10px);
-          border: 1px solid rgba(255, 255, 255, 0.2);
-          transition: transform 0.3s ease;
-        }
-        
-        .card:hover {
-          transform: translateY(-5px);
-        }
-        
-        .card-header {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          margin-bottom: 25px;
-          padding-bottom: 15px;
-          border-bottom: 2px solid #f7fafc;
-        }
-        
-        .card-header h2 {
-          font-size: 20px;
-          font-weight: 600;
-          color: var(--text-primary);
-          display: flex;
-          align-items: center;
-          gap: 10px;
-        }
-        
-        .card-header .icon {
-          width: 40px;
-          height: 40px;
-          border-radius: 10px;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 18px;
-        }
-        
-        .card-header .server-icon {
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          color: white;
-        }
-        
-        .card-header .history-icon {
-          background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-          color: white;
-        }
-        
-        /* 表格样式 */
-        .stats-table-container {
-          overflow-x: auto;
-          border-radius: 10px;
-          background: white;
-          box-shadow: var(--shadow-sm);
-        }
-        
-        .stats-table {
-          width: 100%;
-          border-collapse: collapse;
-          min-width: 600px;
-        }
-        
-        .stats-table thead {
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
-        
-        .stats-table th {
-          padding: 16px 20px;
-          text-align: left;
-          color: white;
-          font-weight: 600;
-          font-size: 14px;
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-        }
-        
-        .stats-table th:first-child {
-          border-top-left-radius: 10px;
-        }
-        
-        .stats-table th:last-child {
-          border-top-right-radius: 10px;
-        }
-        
-        .stats-table tbody tr {
-          border-bottom: 1px solid var(--border-color);
-          transition: background 0.2s ease;
-        }
-        
-        .stats-table tbody tr:hover {
-          background: #f8fafc;
-        }
-        
-        .stats-table tbody tr:last-child {
-          border-bottom: none;
-        }
-        
-        .stats-table td {
-          padding: 18px 20px;
-          color: var(--text-primary);
-        }
-        
-        /* 状态徽章 */
-        .status-badge {
-          padding: 6px 12px;
-          border-radius: 6px;
-          font-size: 12px;
-          font-weight: 600;
-          display: inline-block;
-          min-width: 60px;
-          text-align: center;
-        }
-        
-        .status-success {
-          background: linear-gradient(135deg, #c6f6d5 0%, #9ae6b4 100%);
-          color: #22543d;
-        }
-        
-        .status-failed {
-          background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
-          color: #742a2a;
-        }
-        
-        /* 动态权重徽章基础样式 */
-        .weight-badge {
-          display: inline-block;
-          padding: 6px 12px;
-          background: var(--weight-gradient);
-          color: #22543d;
-          border-radius: 20px;
-          font-size: 13px;
-          font-weight: 700;
-          text-align: center;
-          min-width: 60px;
-          box-shadow: 0 2px 4px rgba(67, 233, 123, 0.3);
-          transition: transform 0.2s ease;
-        }
-        
-        .weight-badge:hover {
-          transform: scale(1.05);
-        }
-        
-        /* 权重信息容器 */
-        .weight-info {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          flex-wrap: wrap;
-        }
-        
-        .weight-label {
-          font-size: 12px;
-          color: var(--text-secondary);
-          white-space: nowrap;
-        }
-        
-        /* 进度条 */
-        .progress-container {
-          background: #e2e8f0;
-          border-radius: 10px;
-          height: 8px;
-          overflow: hidden;
-          margin-top: 8px;
-        }
-        
-        .progress-bar {
-          height: 100%;
-          background: linear-gradient(90deg, #4fd1c5 0%, #38b2ac 100%);
-          border-radius: 10px;
-          transition: width 0.5s ease;
-        }
-        
-        /* 加载状态 */
-        .loading-state {
-          text-align: center;
-          padding: 60px 20px;
-        }
-        
-        .loading-spinner {
-          width: 50px;
-          height: 50px;
-          border: 3px solid #e2e8f0;
-          border-top-color: #667eea;
-          border-radius: 50%;
-          margin: 0 auto 20px;
-          animation: spin 1s linear infinite;
-        }
-        
-        .empty-state {
-          text-align: center;
-          padding: 60px 20px;
-          color: var(--text-secondary);
-        }
-        
-        .empty-state i {
-          font-size: 48px;
-          margin-bottom: 20px;
-          color: #cbd5e0;
-        }
-        
-        .error-state {
-          text-align: center;
-          padding: 40px 20px;
-          background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
-          border-radius: 10px;
-          color: #742a2a;
-        }
-        
-        /* 响应式表格单元格 */
-        .mobile-row {
-          display: none;
-        }
-        
-        /* 调试信息 */
-        .debug-panel {
-          background: #1a202c;
-          color: #e2e8f0;
-          border-radius: 10px;
-          padding: 20px;
-          margin-top: 20px;
-          font-family: 'Monaco', 'Courier New', monospace;
-          font-size: 12px;
-          max-height: 300px;
-          overflow-y: auto;
-        }
-        
-        .debug-header {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          margin-bottom: 15px;
-        }
-        
-        .debug-header h4 {
-          color: #81e6d9;
-        }
-        
-        .debug-log {
-          padding: 8px 0;
-          border-bottom: 1px solid #2d3748;
-        }
-        
-        .debug-log:last-child {
-          border-bottom: none;
-        }
-        
-        /* 动画 */
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
-        
-        @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(10px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-        
-        .fade-in {
-          animation: fadeIn 0.5s ease-out;
-        }
-        
-        /* 移动端优化 */
-        @media (max-width: 768px) {
-          body {
-            padding: 15px;
-          }
-          
-          .header {
-            padding: 20px;
-          }
-          
-          .header-content {
-            flex-direction: column;
-            align-items: stretch;
-          }
-          
-          .action-buttons {
-            justify-content: center;
-          }
-          
-          .btn {
-            padding: 10px 16px;
-            font-size: 13px;
-          }
-          
-          .stats-table {
-            min-width: auto;
-          }
-          
-          .stats-table thead {
-            display: none;
-          }
-          
-          .stats-table tbody tr {
-            display: block;
-            margin-bottom: 15px;
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            padding: 15px;
-          }
-          
-          .stats-table td {
-            display: block;
-            padding: 8px 0;
-            border: none;
-          }
-          
-          .stats-table td:before {
-            content: attr(data-label);
-            font-weight: 600;
-            color: var(--text-secondary);
-            display: block;
-            margin-bottom: 4px;
-            font-size: 12px;
-            text-transform: uppercase;
-          }
-          
-          .mobile-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
-          }
-          
-          /* 修改：移动端后端地址只显示mobile-row，隐藏桌面端div */
-          #backend-stats-container .stats-table td:first-child > div:not(.mobile-row) {
-            display: none !important;
-          }
-          
-          #backend-stats-container .stats-table td:first-child .mobile-row {
-            display: block;
-            margin-bottom: 0;
-          }
-          
-          #backend-stats-container .stats-table td:first-child .mobile-row strong {
-            display: block;
-            word-break: break-all;
-            font-size: 14px;
-            color: var(--text-primary);
-          }
-          
-          /* 修改：移动端最近请求记录显示优化 - 隐藏桌面端div，只显示mobile-row */
-          #recent-requests-container .stats-table td:first-child > div:not(.mobile-row) {
-            display: none !important;
-          }
-          
-          #recent-requests-container .stats-table td:first-child .mobile-row {
-            display: block;
-            margin-bottom: 0;
-          }
-          
-          #recent-requests-container .stats-table td:first-child .mobile-row strong {
-            display: block;
-            word-break: break-all;
-            font-size: 14px;
-            color: var(--text-primary);
-          }
-          
-          /* 修改：移动端副标题居中 */
-          .title-section p {
-            text-align: center;
-            width: 100%;
-          }
-          
-          /* 移动端适配 - 权重徽章 */
-          .weight-badge {
-            font-size: 12px;
-            padding: 4px 8px;
-            min-width: 50px;
-          }
-          
-          .weight-info {
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 5px;
-          }
-        }
-        
-        /* 亮色/暗色主题切换支持 */
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --card-bg: rgba(45, 55, 72, 0.95);
-            --text-primary: #f7fafc;
-            --text-secondary: #a0aec0;
-            --border-color: #4a5568;
-          }
-          
-          body {
-            background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%);
-          }
-          
-          .card {
-            border: 1px solid rgba(255, 255, 255, 0.1);
-          }
-          
-          .stats-table-container {
-            background: #2d3748;
-          }
-          
-          .stats-table tbody tr:hover {
-            background: #4a5568;
-          }
-          
-          .progress-container {
-            background: #4a5568;
-          }
-          
-          /* 暗色主题适配 - 权重徽章 */
-          .weight-badge {
-            background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
-            color: #81e6d9;
-            border: 1px solid #38a169;
-          }
-        }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <div class="header fade-in">
-          <div class="header-content">
-            <div class="title-section">
-              <h1>
-                <i class="fas fa-balance-scale"></i>
-                订阅转换负载均衡系统
-              </h1>
-              <p>基于最近20条请求成功率加权轮询 | 实时监控 | 性能统计</p>
-            </div>
-            <div class="action-buttons">
-              <button class="btn btn-primary" onclick="refreshData()">
-                <i class="fas fa-sync-alt"></i> 刷新数据
-              </button>
-              <button class="btn btn-secondary" onclick="location.href='/init'">
-                <i class="fas fa-cog"></i> 系统设置
-              </button>
-              <button class="btn btn-secondary" onclick="toggleDebug()">
-                <i class="fas fa-terminal"></i> 调试模式
-              </button>
-            </div>
-          </div>
-          
-          <div id="debug-panel" class="debug-panel" style="display: none;">
-            <div class="debug-header">
-              <h4><i class="fas fa-bug"></i> 系统调试信息</h4>
-              <button class="btn btn-secondary" onclick="clearDebugLogs()" style="padding: 4px 8px; font-size: 11px;">
-                清空日志
-              </button>
-            </div>
-            <div id="debug-content"></div>
-          </div>
-        </div>
-        
-        <div class="stats-grid">
-          <!-- 后端服务器状态卡片 -->
-          <div class="card fade-in" style="animation-delay: 0.1s;">
-            <div class="card-header">
-              <h2>
-                <span class="icon server-icon">
-                  <i class="fas fa-server"></i>
-                </span>
-                后端服务器状态
-              </h2>
-              <div class="stats-info">
-                <span style="color: var(--text-secondary); font-size: 14px;">
-                  总计: <span id="total-backends">${backendStats.length}</span> 个
-                </span>
-              </div>
-            </div>
-            <div id="backend-stats-container">
-              ${backendStats.length > 0 ? `
-                <div class="stats-table-container">
-                  <table class="stats-table">
-                    <thead>
-                      <tr>
-                        <th>后端地址</th>
-                        <th>请求统计</th>
-                        <th>性能指标</th>
-                        <th>权重状态</th>
-                      </tr>
-                    </thead>
-                    <tbody id="backend-stats-body">
-                      ${backendStats.map(backend => {
-                        const totalRequests = backend.total_requests || 0;
-                        const successCount = backend.success_count || 0;
-                        const successRate = totalRequests > 0 ? ((successCount / totalRequests) * 100).toFixed(1) : '0.0';
-                        const avgResponseTime = backend.average_response_time || 0;
-                        const dynamicWeight = backend.dynamic_weight || backend.weight || INITIAL_WEIGHT;
-                        
-                        return `
-                        <tr>
-                          <td data-label="后端地址">
-                            <div class="mobile-row">
-                              <strong>${backend.url || '未知'}</strong>
-                              ${backend.enabled === 0 ? '<span class="status-badge status-failed" style="margin-left: 8px;">已禁用</span>' : ''}
-                            </div>
-                            <div style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;">
-                              ${backend.url || '未知'}
-                            </div>
-                            ${backend.enabled === 0 ? '<div><span class="status-badge status-failed">已禁用</span></div>' : ''}
-                          </td>
-                          <td data-label="请求统计">
-                            <div style="margin-bottom: 4px;">
-                              <small>总请求: ${totalRequests}</small>
-                            </div>
-                            <div style="margin-bottom: 4px;">
-                              <small>成功: ${successCount} | 失败: ${backend.fail_count || 0}</small>
-                            </div>
-                            <div>
-                              <small>成功率: ${successRate}%</small>
-                            </div>
-                            <div class="progress-container">
-                              <div class="progress-bar" style="width: ${Math.min(successRate, 100)}%"></div>
-                            </div>
-                          </td>
-                          <td data-label="性能指标">
-                            <div style="margin-bottom: 4px;">
-                              <small>平均响应: ${formatResponseTimeForHTML(avgResponseTime)}</small>
-                            </div>
-                            <div>
-                              <small>最后响应: ${formatResponseTimeForHTML(backend.last_response_time || 0)}</small>
-                            </div>
-                          </td>
-                          <td data-label="权重状态">
-                            <div style="margin-bottom: 4px;">
-                              <small>基础权重: ${backend.weight || INITIAL_WEIGHT}</small>
-                            </div>
-                            <div style="margin-bottom: 4px;">
-                              <small>动态权重: ${dynamicWeight.toFixed(1)}</small>
-                            </div>
-                            <div>
-                              <small>最后使用: ${backend.last_used ? formatBeijingTimeForHTML(backend.last_used) : '从未'}</small>
-                            </div>
-                          </td>
-                        </tr>
-                        `;
-                      }).join('')}
-                    </tbody>
-                  </table>
-                </div>
-              ` : `
-                <div class="loading-state" id="backend-stats-loading">
-                  <div class="loading-spinner"></div>
-                  <p>正在加载后端服务器数据...</p>
-                </div>
-              `}
-            </div>
-          </div>
-          
-          <!-- 最近请求记录卡片 -->
-          <div class="card fade-in" style="animation-delay: 0.2s;">
-            <div class="card-header">
-              <h2>
-                <span class="icon history-icon">
-                  <i class="fas fa-history"></i>
-                </span>
-                最近请求记录
-              </h2>
-              <div class="stats-info">
-                <span style="color: var(--text-secondary); font-size: 14px;">
-                  最近20条记录
-                </span>
-              </div>
-            </div>
-            <div id="recent-requests-container">
-              ${recentRequests.length > 0 ? `
-                <div class="stats-table-container">
-                  <table class="stats-table">
-                    <thead>
-                      <tr>
-                        <th>后端地址</th>
-                        <th>状态</th>
-                        <th>动态权重</th>
-                        <th>响应时间</th>
-                        <th>请求时间</th>
-                      </tr>
-                    </thead>
-                    <tbody id="recent-requests-body">
-                      ${recentRequests.map(log => {
-                        const statusClass = log.status === 'success' ? 'status-success' : 'status-failed';
-                        const statusText = log.status === 'success' ? '成功' : '失败';
-                        const dynamicWeight = log.dynamic_weight || 0;
-                        const weightLevel = dynamicWeight >= 15 ? '高权重' : dynamicWeight >= 10 ? '中权重' : '低权重';
-                        
-                        return `
-                        <tr>
-                          <td data-label="后端地址">
-                            <div class="mobile-row">
-                              <strong>${log.backend_url || '未知'}</strong>
-                            </div>
-                            <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
-                              ${log.backend_url || '未知'}
-                            </div>
-                          </td>
-                          <td data-label="状态">
-                            <span class="status-badge ${statusClass}">${statusText}</span>
-                            ${log.error_message ? `
-                              <div style="margin-top: 4px;">
-                                <small style="color: #718096; font-size: 11px;">
-                                  ${log.error_message.substring(0, 40)}${log.error_message.length > 40 ? '...' : ''}
-                                </small>
-                              </div>
-                            ` : ''}
-                          </td>
-                          <td data-label="动态权重">
-                            <div class="weight-info">
-                              <span class="weight-badge" title="请求时的动态权重">${dynamicWeight.toFixed(1)}</span>
-                              <div class="weight-label">${weightLevel}</div>
-                            </div>
-                          </td>
-                          <td data-label="响应时间">
-                            ${formatResponseTimeForHTML(log.response_time || 0)}
-                          </td>
-                          <td data-label="请求时间">
-                            ${formatBeijingTimeForHTML(log.request_time || new Date().toISOString())}
-                          </td>
-                        </tr>
-                        `;
-                      }).join('')}
-                    </tbody>
-                  </table>
-                </div>
-              ` : `
-                <div class="loading-state" id="recent-requests-loading">
-                  <div class="loading-spinner"></div>
-                  <p>正在加载请求记录...</p>
-                </div>
-              `}
-            </div>
-          </div>
-        </div>
-        
-        <!-- 系统信息卡片 -->
-        <div class="card fade-in" style="animation-delay: 0.3s; margin-top: 25px;">
-          <div class="card-header">
-            <h2>
-              <span class="icon" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white;">
-                <i class="fas fa-info-circle"></i>
-              </span>
-              系统信息
-            </h2>
-          </div>
-          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">
-            <div class="info-item">
-              <h3 style="color: var(--text-secondary); font-size: 14px; margin-bottom: 8px;">权重算法</h3>
-              <p style="font-size: 16px; font-weight: 500;">
-                基于最近20条请求的成功率动态调整
-              </p>
-              <p style="font-size: 13px; color: var(--text-secondary);">
-                范围: ${MIN_WEIGHT} - ${MAX_WEIGHT}
-              </p>
-            </div>
-            <div class="info-item">
-              <h3 style="color: var(--text-secondary); font-size: 14px; margin-bottom: 8px;">最近活动</h3>
-              <p style="font-size: 16px; font-weight: 500;" id="last-update-time">
-                正在更新...
-              </p>
-              <p style="font-size: 13px; color: var(--text-secondary);">
-                每120秒自动刷新
-              </p>
-            </div>
-            <div class="info-item">
-              <h3 style="color: var(--text-secondary); font-size: 14px; margin-bottom: 8px;">数据统计</h3>
-              <p style="font-size: 16px; font-weight: 500;">
-                保留最近 <strong>100</strong> 条日志
-              </p>
-              <p style="font-size: 13px; color: var(--text-secondary);">
-                基于动态权重智能选择
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-      
-      <script>
-        // 工具函数
-        function formatBeijingTime(isoString) {
-          if (!isoString) return '从未';
-          try {
-            const date = new Date(isoString);
-            return date.toLocaleString('zh-CN', { 
-              timeZone: 'Asia/Shanghai',
-              year: 'numeric',
-              month: '2-digit',
-              day: '2-digit',
-              hour: '2-digit',
-              minute: '2-digit',
-              second: '2-digit'
-            });
-          } catch (e) {
-            console.error('时间格式化错误:', e);
-            return isoString;
-          }
-        }
-        
-        function formatResponseTime(ms) {
-          if (!ms || ms < 0) return '0ms';
-          if (ms < 1000) return ms.toFixed(0) + 'ms';
-          return (ms / 1000).toFixed(2) + 's';
-        }
-        
-        // 调试系统
-        let debugEnabled = localStorage.getItem('debugEnabled') === 'true';
-        let debugLogs = JSON.parse(localStorage.getItem('debugLogs') || '[]');
-        
-        function addDebugLog(message, data = null) {
-          const timestamp = new Date().toLocaleString('zh-CN');
-          const logEntry = {
-            timestamp,
-            message,
-            data: data ? JSON.stringify(data).substring(0, 200) : null
-          };
-          
-          debugLogs.unshift(logEntry);
-          if (debugLogs.length > 50) debugLogs.pop();
-          
-          localStorage.setItem('debugLogs', JSON.stringify(debugLogs));
-          
-          if (debugEnabled) {
-            updateDebugPanel();
-          }
-        }
-        
-        function updateDebugPanel() {
-          const debugContent = document.getElementById('debug-content');
-          if (!debugContent) return;
-          
-          let html = debugLogs.map(log => \`
-            <div class="debug-log">
-              <div style="color: #81e6d9; font-size: 11px;">\${log.timestamp}</div>
-              <div>\${log.message}</div>
-              \${log.data ? \`<div style="color: #a0aec0; font-size: 10px;">\${log.data}</div>\` : ''}
-            </div>
-          \`).join('');
-          
-          debugContent.innerHTML = html;
-        }
-        
-        function clearDebugLogs() {
-          debugLogs = [];
-          localStorage.setItem('debugLogs', JSON.stringify(debugLogs));
-          updateDebugPanel();
-        }
-        
-        function toggleDebug() {
-          debugEnabled = !debugEnabled;
-          localStorage.setItem('debugEnabled', debugEnabled);
-          
-          const debugPanel = document.getElementById('debug-panel');
-          debugPanel.style.display = debugEnabled ? 'block' : 'none';
-          
-          if (debugEnabled) {
-            updateDebugPanel();
-          }
-        }
-        
-        // 数据加载函数
-        async function loadBackendStats() {
-          addDebugLog('开始加载后端统计');
-          
-          const container = document.getElementById('backend-stats-container');
-          const loadingHTML = \`
-            <div class="loading-state">
-              <div class="loading-spinner"></div>
-              <p>正在加载后端服务器数据...</p>
-            </div>
-          \`;
-          
-          container.innerHTML = loadingHTML;
-          
-          try {
-            const response = await fetch('/api/backend-stats?_t=' + Date.now());
-            addDebugLog('后端统计响应状态', { status: response.status });
-            
-            if (!response.ok) {
-              throw new Error(\`HTTP \${response.status}: \${response.statusText}\`);
-            }
-            
-            const data = await response.json();
-            addDebugLog('后端统计数据接收', { count: data.length });
-            
-            if (!Array.isArray(data) || data.length === 0) {
-              container.innerHTML = \`
-                <div class="empty-state">
-                  <i class="fas fa-server"></i>
-                  <h3>暂无后端服务器</h3>
-                  <p>请前往系统设置初始化数据库</p>
-                  <button class="btn btn-primary" onclick="location.href='/init'" style="margin-top: 15px;">
-                    <i class="fas fa-cog"></i> 前往设置
-                  </button>
-                </div>
-              \`;
-              return;
-            }
-            
-            // 更新总数显示
-            document.getElementById('total-backends').textContent = data.length;
-            
-            // 构建表格
-            let html = \`
-              <div class="stats-table-container">
-                <table class="stats-table">
-                  <thead>
-                    <tr>
-                      <th>后端地址</th>
-                      <th>请求统计</th>
-                      <th>性能指标</th>
-                      <th>权重状态</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-            \`;
-            
-            data.forEach(backend => {
-              const totalRequests = backend.total_requests || 0;
-              const successCount = backend.success_count || 0;
-              const successRate = totalRequests > 0 
-                ? ((successCount / totalRequests) * 100).toFixed(1) 
-                : '0.0';
-              const avgResponseTime = backend.average_response_time || 0;
-              const dynamicWeight = backend.dynamic_weight || backend.weight || ${INITIAL_WEIGHT};
-              
-              html += \`
-                <tr>
-                  <td data-label="后端地址">
-                    <div class="mobile-row">
-                      <strong>\${backend.url || '未知'}</strong>
-                      \${backend.enabled === 0 ? '<span class="status-badge status-failed" style="margin-left: 8px;">已禁用</span>' : ''}
-                    </div>
-                    <div style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;">
-                      \${backend.url || '未知'}
-                    </div>
-                    \${backend.enabled === 0 ? '<div><span class="status-badge status-failed">已禁用</span></div>' : ''}
-                  </td>
-                  <td data-label="请求统计">
-                    <div style="margin-bottom: 4px;">
-                      <small>总请求: \${totalRequests}</small>
-                    </div>
-                    <div style="margin-bottom: 4px;">
-                      <small>成功: \${successCount} | 失败: \${backend.fail_count || 0}</small>
-                    </div>
-                    <div>
-                      <small>成功率: \${successRate}%</small>
-                    </div>
-                    <div class="progress-container">
-                      <div class="progress-bar" style="width: \${Math.min(successRate, 100)}%"></div>
-                    </div>
-                  </td>
-                  <td data-label="性能指标">
-                    <div style="margin-bottom: 4px;">
-                      <small>平均响应: \${formatResponseTime(avgResponseTime)}</small>
-                    </div>
-                    <div>
-                      <small>最后响应: \${formatResponseTime(backend.last_response_time || 0)}</small>
-                    </div>
-                  </td>
-                  <td data-label="权重状态">
-                    <div style="margin-bottom: 4px;">
-                      <small>基础权重: \${backend.weight || ${INITIAL_WEIGHT}}</small>
-                    </div>
-                    <div style="margin-bottom: 4px;">
-                      <small>动态权重: \${dynamicWeight.toFixed(1)}</small>
-                    </div>
-                    <div>
-                      <small>最后使用: \${backend.last_used ? formatBeijingTime(backend.last_used) : '从未'}</small>
-                    </div>
-                  </td>
-                </tr>
-              \`;
-            });
-            
-            html += '</tbody></table></div>';
-            container.innerHTML = html;
-            addDebugLog('后端统计表格渲染完成');
-            
-          } catch (error) {
-            console.error('加载后端统计失败:', error);
-            addDebugLog('加载后端统计失败', { error: error.message });
-            
-            container.innerHTML = \`
-              <div class="error-state">
-                <i class="fas fa-exclamation-triangle"></i>
-                <h3>加载失败</h3>
-                <p>\${error.message}</p>
-                <button class="btn btn-primary" onclick="loadBackendStats()" style="margin-top: 15px;">
-                  <i class="fas fa-redo"></i> 重新加载
-                </button>
-              </div>
-            \`;
-          }
-        }
-        
-        async function loadRecentRequests() {
-          addDebugLog('开始加载最近请求');
-          
-          const container = document.getElementById('recent-requests-container');
-          const loadingHTML = \`
-            <div class="loading-state">
-              <div class="loading-spinner"></div>
-              <p>正在加载请求记录...</p>
-            </div>
-          \`;
-          
-          container.innerHTML = loadingHTML;
-          
-          try {
-            const response = await fetch('/api/recent-requests?_t=' + Date.now());
-            addDebugLog('最近请求响应状态', { status: response.status });
-            
-            if (!response.ok) {
-              throw new Error(\`HTTP \${response.status}: \${response.statusText}\`);
-            }
-            
-            const data = await response.json();
-            addDebugLog('最近请求数据接收', { count: data.length });
-            
-            if (!Array.isArray(data) || data.length === 0) {
-              container.innerHTML = \`
-                <div class="empty-state">
-                  <i class="fas fa-history"></i>
-                  <h3>暂无请求记录</h3>
-                  <p>系统尚未处理任何请求</p>
-                </div>
-              \`;
-              return;
-            }
-            
-            // 构建表格
-            let html = \`
-              <div class="stats-table-container">
-                <table class="stats-table">
-                  <thead>
-                    <tr>
-                      <th>后端地址</th>
-                      <th>状态</th>
-                      <th>动态权重</th>
-                      <th>响应时间</th>
-                      <th>请求时间</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-            \`;
-            
-            data.forEach(log => {
-              const statusClass = log.status === 'success' ? 'status-success' : 'status-failed';
-              const statusText = log.status === 'success' ? '成功' : '失败';
-              const dynamicWeight = log.dynamic_weight || 0;
-              const weightLevel = dynamicWeight >= 15 ? '高权重' : dynamicWeight >= 10 ? '中权重' : '低权重';
-              
-              html += \`
-                <tr>
-                  <td data-label="后端地址">
-                    <div class="mobile-row">
-                      <strong>\${log.backend_url || '未知'}</strong>
-                    </div>
-                    <div style="max-width: 180px; overflow: hidden; text-overflow: ellipsis;">
-                      \${log.backend_url || '未知'}
-                    </div>
-                  </td>
-                  <td data-label="状态">
-                    <span class="status-badge \${statusClass}">\${statusText}</span>
-                    \${log.error_message ? \`
-                      <div style="margin-top: 4px;">
-                        <small style="color: #718096; font-size: 11px;">
-                          \${log.error_message.substring(0, 40)}\${log.error_message.length > 40 ? '...' : ''}
-                        </small>
-                      </div>
-                    \` : ''}
-                  </td>
-                  <td data-label="动态权重">
-                    <div class="weight-info">
-                      <span class="weight-badge" title="请求时的动态权重">\${dynamicWeight.toFixed(1)}</span>
-                      <div class="weight-label">\${weightLevel}</div>
-                    </div>
-                  </td>
-                  <td data-label="响应时间">
-                    \${formatResponseTime(log.response_time || 0)}
-                  </td>
-                  <td data-label="请求时间">
-                    \${formatBeijingTime(log.request_time || new Date().toISOString())}
-                  </td>
-                </tr>
-              \`;
-            });
-            
-            html += '</tbody></table></div>';
-            container.innerHTML = html;
-            addDebugLog('最近请求表格渲染完成');
-            
-          } catch (error) {
-            console.error('加载最近请求失败:', error);
-            addDebugLog('加载最近请求失败', { error: error.message });
-            
-            container.innerHTML = \`
-              <div class="error-state">
-                <i class="fas fa-exclamation-triangle"></i>
-                <h3>加载失败</h3>
-                <p>\${error.message}</p>
-                <button class="btn btn-primary" onclick="loadRecentRequests()" style="margin-top: 15px;">
-                  <i class="fas fa-redo"></i> 重新加载
-                </button>
-              </div>
-            \`;
-          }
-        }
-        
-        // 刷新所有数据
-        function refreshData() {
-          addDebugLog('手动刷新数据');
-          document.getElementById('last-update-time').textContent = formatBeijingTime(new Date().toISOString());
-          loadBackendStats();
-          loadRecentRequests();
-        }
-        
-        // 页面初始化
-        document.addEventListener('DOMContentLoaded', () => {
-          addDebugLog('页面加载完成');
-          
-          // 初始化调试面板
-          if (debugEnabled) {
-            document.getElementById('debug-panel').style.display = 'block';
-            updateDebugPanel();
-          }
-          
-          // 设置最后更新时间
-          document.getElementById('last-update-time').textContent = formatBeijingTime(new Date().toISOString());
-          
-          // 如果初始数据为空，则从API加载
-          if (${backendStats.length} === 0) {
-            loadBackendStats();
-          }
-          
-          if (${recentRequests.length} === 0) {
-            loadRecentRequests();
-          }
-          
-          // 每120秒自动刷新（修改为120秒）
-          setInterval(refreshData, 120000);
-          
-          // 监听页面可见性变化
-          document.addEventListener('visibilitychange', () => {
-            if (!document.hidden) {
-              addDebugLog('页面变为可见，刷新数据');
-              refreshData();
-            }
-          });
+      ctx.waitUntil((async () => {
+        await logRequest(env, {
+          backend_url: backend.url,
+          response_time: responseTime,
+          status: status,
+          error_message: errorMsg,
+          dynamic_weight: backend.dynamic_weight,
+          request_time: new Date().toISOString()
         });
-        
-        // 添加键盘快捷键
-        document.addEventListener('keydown', (e) => {
-          // Ctrl + R 刷新
-          if (e.ctrlKey && e.key === 'r') {
-            e.preventDefault();
-            refreshData();
-            addDebugLog('使用快捷键刷新数据');
-          }
-          
-          // Ctrl + D 切换调试
-          if (e.ctrlKey && e.key === 'd') {
-            e.preventDefault();
-            toggleDebug();
-          }
-        });
-      </script>
-    </body>
-    </html>
-  `;
-  
-  return new Response(html, {
-    headers: {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
+        await updateBackendStats(env, backend.id, backend.url, false, responseTime, config);
+      })());
+
+      logInfo(`后端 ${backend.url} 请求异常 (${errorMsg})，尝试重试 (${attempt}/${maxRetries})`);
     }
+  }
+
+  return new Response(JSON.stringify({ error: 'All backends failed', attempts: maxRetries }), {
+    status: 503,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
   });
 }
 
-// 辅助函数：在HTML模板中使用的格式化函数
+// ---------- 处理版本请求 ----------
+async function handleVersionRequest(request, env, ctx) {
+  const config = getConfig(env);
+  const maxRetries = 2;
+  const triedIds = new Set();
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const backend = await selectBackend(env, config, Array.from(triedIds));
+    if (!backend) break;
+    triedIds.add(backend.id);
+    try {
+      const versionUrl = `${backend.url}/version`;
+      const res = await fetchWithTimeout(versionUrl, {}, config.REQUEST_TIMEOUT);
+      if (res.ok) {
+        const text = await res.text();
+        return new Response(text, {
+          headers: { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }
+        });
+      }
+    } catch (e) {
+      logError(`版本请求失败 ${backend.url}`, e);
+    }
+  }
+  return new Response('Version check failed', { status: 503 });
+}
+
+// ---------- 健康检查（定时任务）----------
+async function scheduled(event, env, ctx) {
+  const config = getConfig(env);
+  logInfo('开始执行健康检查');
+  try {
+    const backends = await env.DB.prepare(`SELECT id, url FROM backend_servers WHERE enabled = 1`).all();
+    if (!backends.results) return;
+
+    for (const backend of backends.results) {
+      try {
+        await fetchWithTimeout(`${backend.url}/version`, {}, config.REQUEST_TIMEOUT);
+        const ok = true;
+        await env.DB.prepare(`
+          UPDATE backend_servers 
+          SET healthy = ?, last_health_check = datetime('now')
+          WHERE id = ?
+        `).bind(ok ? 1 : 0, backend.id).run();
+        logDebug(`健康检查 ${backend.url}: 通过`);
+      } catch (e) {
+        await env.DB.prepare(`UPDATE backend_servers SET healthy = 0, last_health_check = datetime('now') WHERE id = ?`).bind(backend.id).run();
+        logError(`健康检查异常 ${backend.url}`, e);
+      }
+    }
+  } catch (error) {
+    logError('健康检查整体失败', error);
+  }
+}
+
+// ---------- API 处理函数 ----------
+async function handleBackendStats(request, env) {
+  try {
+    const result = await env.DB.prepare(`
+      SELECT id, url, weight, dynamic_weight, total_requests, success_count, fail_count,
+             average_response_time, last_response_time, ewma_success_rate, consecutive_failures,
+             last_used, enabled, healthy, last_health_check, created_at
+      FROM backend_servers ORDER BY dynamic_weight DESC
+    `).all();
+    return new Response(JSON.stringify(result.results || []), {
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+async function handleRecentRequests(request, env) {
+  try {
+    const result = await env.DB.prepare(`
+      SELECT id, backend_url, response_time, status, error_message, dynamic_weight, request_time
+      FROM request_logs ORDER BY request_time DESC LIMIT 20
+    `).all();
+    return new Response(JSON.stringify(result.results || []), {
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+async function handleInitDatabase(request, env) {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+  const config = getConfig(env);
+  try {
+    await ensureDatabaseInitialized(env);
+    await env.DB.prepare('DELETE FROM backend_servers').run();
+    await env.DB.prepare('DELETE FROM request_logs').run();
+
+    let inserted = 0, errors = [];
+    for (const url of config.DEFAULT_BACKENDS) {
+      try {
+        await env.DB.prepare(`
+          INSERT INTO backend_servers (url, weight, dynamic_weight, ewma_success_rate, healthy)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(url, config.INITIAL_WEIGHT, config.INITIAL_WEIGHT, 0.5, 1).run();
+        inserted++;
+      } catch (e) {
+        errors.push({ url, error: e.message });
+      }
+    }
+    return new Response(JSON.stringify({ success: true, backends_added: inserted, errors }), {
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ success: false, error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+// ---------- 页面处理：状态页面（已修复语法错误）----------
+async function handleStatusPage(request, env) {
+  const config = getConfig(env);
+  const [backendStats, recentRequests] = await Promise.allSettled([
+    env.DB.prepare(`
+      SELECT id, url, weight, dynamic_weight, total_requests, success_count, fail_count,
+             average_response_time, last_response_time, ewma_success_rate, consecutive_failures,
+             last_used, enabled, healthy, last_health_check
+      FROM backend_servers ORDER BY dynamic_weight DESC LIMIT 10
+    `).all(),
+    env.DB.prepare(`
+      SELECT backend_url, response_time, status, error_message, dynamic_weight, request_time
+      FROM request_logs ORDER BY request_time DESC LIMIT 10
+    `).all()
+  ]);
+
+  const backends = backendStats.value?.results || [];
+  const requests = recentRequests.value?.results || [];
+
+  // 构建 HTML（确保所有变量定义在模板字符串外部，避免语法错误）
+  const backendRows = backends.map(b => {
+    const total = b.total_requests || 0;
+    const success = b.success_count || 0;
+    const fail = b.fail_count || 0;
+    const rate = total > 0 ? ((success / total) * 100).toFixed(1) : '0.0';
+    const avgRT = b.average_response_time || 0;
+    const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
+    const consecFails = b.consecutive_failures || 0;
+    const healthy = b.healthy === 1;
+    const dynamicWeight = b.dynamic_weight || b.weight || config.INITIAL_WEIGHT;
+
+    return `<tr>
+      <td data-label="后端地址">
+        <div class="mobile-row"><strong>${b.url || '未知'}</strong></div>
+        <div style="display:flex; flex-wrap:wrap; gap:6px;">
+          <span class="healthy-badge ${healthy ? 'healthy-true' : 'healthy-false'}">${healthy ? '健康' : '不健康'}</span>
+          ${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
+        </div>
+        <div style="max-width:200px; overflow:hidden; text-overflow:ellipsis;">${b.url || '未知'}</div>
+      </td>
+      <td data-label="请求统计">
+        <div><small>总请求: ${total}</small></div>
+        <div><small>成功: ${success} | 失败: ${fail}</small></div>
+        <div><small>成功率: ${rate}%</small></div>
+        <div class="progress-container"><div class="progress-bar" style="width:${Math.min(rate, 100)}%"></div></div>
+      </td>
+      <td data-label="性能指标">
+        <div><small>平均响应: ${formatResponseTimeForHTML(avgRT)}</small></div>
+        <div><small>最后响应: ${formatResponseTimeForHTML(b.last_response_time || 0)}</small></div>
+        <div><small>EWMA成功率: ${ewma}</small></div>
+        <div><small>连续失败: ${consecFails}</small></div>
+      </td>
+      <td data-label="权重状态">
+        <div><small>基础权重: ${b.weight || config.INITIAL_WEIGHT}</small></div>
+        <div><small>动态权重: ${dynamicWeight.toFixed(1)}</small></div>
+        <div><small>最后使用: ${b.last_used ? formatBeijingTimeForHTML(b.last_used) : '从未'}</small></div>
+        <div><small>最后健康检查: ${b.last_health_check ? formatBeijingTimeForHTML(b.last_health_check) : '从未'}</small></div>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const requestRows = requests.map(r => {
+    const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
+    const statusText = r.status === 'success' ? '成功' : '失败';
+    const weight = r.dynamic_weight || 0;
+    const weightLevel = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
+    return `<tr>
+      <td data-label="后端地址">
+        <div class="mobile-row"><strong>${r.backend_url || '未知'}</strong></div>
+        <div style="max-width:180px; overflow:hidden; text-overflow:ellipsis;">${r.backend_url || '未知'}</div>
+      </td>
+      <td data-label="状态">
+        <span class="status-badge ${statusClass}">${statusText}</span>
+        ${r.error_message ? `<div><small style="color:#718096;font-size:11px;">${r.error_message.substring(0,40)}${r.error_message.length>40?'...':''}</small></div>` : ''}
+      </td>
+      <td data-label="动态权重">
+        <div class="weight-info">
+          <span class="weight-badge" title="请求时的动态权重">${weight.toFixed(1)}</span>
+          <div class="weight-label">${weightLevel}权重</div>
+        </div>
+      </td>
+      <td data-label="响应时间">${formatResponseTimeForHTML(r.response_time || 0)}</td>
+      <td data-label="请求时间">${formatBeijingTimeForHTML(r.request_time || new Date().toISOString())}</td>
+    </tr>`;
+  }).join('');
+
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>订阅转换负载均衡 - 状态监控</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      --secondary-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+      --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+      --card-bg: rgba(255, 255, 255, 0.95);
+      --text-primary: #2d3748;
+      --text-secondary: #718096;
+      --border-color: #e2e8f0;
+      --shadow-sm: 0 1px 3px rgba(0,0,0,0.1);
+      --shadow-md: 0 4px 6px rgba(0,0,0,0.1);
+      --shadow-lg: 0 10px 25px rgba(0,0,0,0.1);
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --weight-gradient: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+      --healthy-badge-bg: #c6f6d5;
+      --healthy-badge-text: #22543d;
+      --unhealthy-badge-bg: #fed7d7;
+      --unhealthy-badge-text: #742a2a;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+      min-height: 100vh;
+      color: var(--text-primary);
+      line-height: 1.6;
+      padding: 20px;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    .header {
+      background: var(--card-bg);
+      border-radius: var(--radius-lg);
+      padding: 30px;
+      margin-bottom: 30px;
+      box-shadow: var(--shadow-lg);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+    .header-content {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    .title-section h1 {
+      font-size: 28px;
+      font-weight: 700;
+      background: var(--primary-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 8px;
+    }
+    .title-section p { color: var(--text-secondary); font-size: 16px; }
+    .badge {
+      display: inline-block;
+      padding: 4px 12px;
+      background: var(--success-gradient);
+      color: white;
+      border-radius: 20px;
+      font-size: 14px;
+      font-weight: 600;
+      margin-left: 10px;
+    }
+    .action-buttons { display: flex; gap: 12px; flex-wrap: wrap; }
+    .btn {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: var(--primary-gradient);
+      color: white;
+    }
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-md);
+    }
+    .btn-secondary {
+      background: white;
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+    }
+    .btn-secondary:hover {
+      background: #f7fafc;
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-md);
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+      gap: 25px;
+      margin-bottom: 30px;
+    }
+    @media (max-width: 768px) {
+      .stats-grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--card-bg);
+      border-radius: var(--radius-lg);
+      padding: 30px;
+      box-shadow: var(--shadow-lg);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.2);
+      transition: transform 0.3s ease;
+    }
+    .card:hover { transform: translateY(-5px); }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 25px;
+      padding-bottom: 15px;
+      border-bottom: 2px solid #f7fafc;
+    }
+    .card-header h2 {
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .card-header .icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+    }
+    .card-header .server-icon {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+    .card-header .history-icon {
+      background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+      color: white;
+    }
+    .stats-table-container {
+      overflow-x: auto;
+      border-radius: 10px;
+      background: white;
+      box-shadow: var(--shadow-sm);
+    }
+    .stats-table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 800px;
+    }
+    .stats-table thead {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+    .stats-table th {
+      padding: 16px 20px;
+      text-align: left;
+      color: white;
+      font-weight: 600;
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .stats-table th:first-child { border-top-left-radius: 10px; }
+    .stats-table th:last-child { border-top-right-radius: 10px; }
+    .stats-table tbody tr {
+      border-bottom: 1px solid var(--border-color);
+      transition: background 0.2s ease;
+    }
+    .stats-table tbody tr:hover { background: #f8fafc; }
+    .stats-table tbody tr:last-child { border-bottom: none; }
+    .stats-table td {
+      padding: 18px 20px;
+      color: var(--text-primary);
+    }
+    .status-badge {
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      display: inline-block;
+      min-width: 60px;
+      text-align: center;
+    }
+    .status-success {
+      background: linear-gradient(135deg, #c6f6d5 0%, #9ae6b4 100%);
+      color: #22543d;
+    }
+    .status-failed {
+      background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
+      color: #742a2a;
+    }
+    .healthy-badge {
+      padding: 4px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      display: inline-block;
+    }
+    .healthy-true {
+      background: var(--healthy-badge-bg);
+      color: var(--healthy-badge-text);
+    }
+    .healthy-false {
+      background: var(--unhealthy-badge-bg);
+      color: var(--unhealthy-badge-text);
+    }
+    .weight-badge {
+      display: inline-block;
+      padding: 6px 12px;
+      background: var(--weight-gradient);
+      color: #22543d;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 700;
+      text-align: center;
+      min-width: 60px;
+      box-shadow: 0 2px 4px rgba(67,233,123,0.3);
+      transition: transform 0.2s ease;
+    }
+    .weight-badge:hover { transform: scale(1.05); }
+    .weight-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .weight-label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+    .progress-container {
+      background: #e2e8f0;
+      border-radius: 10px;
+      height: 8px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #4fd1c5 0%, #38b2ac 100%);
+      border-radius: 10px;
+      transition: width 0.5s ease;
+    }
+    .loading-state {
+      text-align: center;
+      padding: 60px 20px;
+    }
+    .loading-spinner {
+      width: 50px;
+      height: 50px;
+      border: 3px solid #e2e8f0;
+      border-top-color: #667eea;
+      border-radius: 50%;
+      margin: 0 auto 20px;
+      animation: spin 1s linear infinite;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-secondary);
+    }
+    .empty-state i {
+      font-size: 48px;
+      margin-bottom: 20px;
+      color: #cbd5e0;
+    }
+    .error-state {
+      text-align: center;
+      padding: 40px 20px;
+      background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
+      border-radius: 10px;
+      color: #742a2a;
+    }
+    .debug-panel {
+      background: #1a202c;
+      color: #e2e8f0;
+      border-radius: 10px;
+      padding: 20px;
+      margin-top: 20px;
+      font-family: 'Monaco', 'Courier New', monospace;
+      font-size: 12px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .debug-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 15px;
+    }
+    .debug-header h4 { color: #81e6d9; }
+    .debug-log {
+      padding: 8px 0;
+      border-bottom: 1px solid #2d3748;
+    }
+    .debug-log:last-child { border-bottom: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .fade-in { animation: fadeIn 0.5s ease-out; }
+    @media (max-width: 768px) {
+      body { padding: 15px; }
+      .header { padding: 20px; }
+      .header-content { flex-direction: column; align-items: stretch; }
+      .action-buttons { justify-content: center; }
+      .btn { padding: 10px 16px; font-size: 13px; }
+      .stats-table { min-width: auto; }
+      .stats-table thead { display: none; }
+      .stats-table tbody tr {
+        display: block;
+        margin-bottom: 15px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 15px;
+      }
+      .stats-table td {
+        display: block;
+        padding: 8px 0;
+        border: none;
+      }
+      .stats-table td:before {
+        content: attr(data-label);
+        font-weight: 600;
+        color: var(--text-secondary);
+        display: block;
+        margin-bottom: 4px;
+        font-size: 12px;
+        text-transform: uppercase;
+      }
+      .mobile-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+      #backend-stats-container .stats-table td:first-child > div:not(.mobile-row) { display: none !important; }
+      #backend-stats-container .stats-table td:first-child .mobile-row { display: block; }
+      #backend-stats-container .stats-table td:first-child .mobile-row strong {
+        display: block; word-break: break-all; font-size: 14px; color: var(--text-primary);
+      }
+      #recent-requests-container .stats-table td:first-child > div:not(.mobile-row) { display: none !important; }
+      #recent-requests-container .stats-table td:first-child .mobile-row { display: block; }
+      #recent-requests-container .stats-table td:first-child .mobile-row strong {
+        display: block; word-break: break-all; font-size: 14px; color: var(--text-primary);
+      }
+      .title-section p { text-align: center; width: 100%; }
+      .weight-badge { font-size: 12px; padding: 4px 8px; min-width: 50px; }
+      .weight-info { flex-direction: column; align-items: flex-start; gap: 5px; }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --card-bg: rgba(45,55,72,0.95);
+        --text-primary: #f7fafc;
+        --text-secondary: #a0aec0;
+        --border-color: #4a5568;
+      }
+      body { background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); }
+      .card { border: 1px solid rgba(255,255,255,0.1); }
+      .stats-table-container { background: #2d3748; }
+      .stats-table tbody tr:hover { background: #4a5568; }
+      .progress-container { background: #4a5568; }
+      .weight-badge {
+        background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
+        color: #81e6d9;
+        border: 1px solid #38a169;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header fade-in">
+      <div class="header-content">
+        <div class="title-section">
+          <h1><i class="fas fa-balance-scale"></i> 订阅转换负载均衡系统</h1>
+          <p>基于 EWMA 成功率、响应时间和连续失败次数的智能加权轮询 | 实时监控</p>
+        </div>
+        <div class="action-buttons">
+          <button class="btn btn-primary" onclick="refreshData()"><i class="fas fa-sync-alt"></i> 刷新数据</button>
+          <button class="btn btn-secondary" onclick="location.href='/init'"><i class="fas fa-cog"></i> 系统设置</button>
+          <button class="btn btn-secondary" onclick="toggleDebug()"><i class="fas fa-terminal"></i> 调试模式</button>
+        </div>
+      </div>
+      <div id="debug-panel" class="debug-panel" style="display: none;">
+        <div class="debug-header">
+          <h4><i class="fas fa-bug"></i> 系统调试信息</h4>
+          <button class="btn btn-secondary" onclick="clearDebugLogs()" style="padding:4px 8px;font-size:11px;">清空日志</button>
+        </div>
+        <div id="debug-content"></div>
+      </div>
+    </div>
+
+    <div class="stats-grid">
+      <!-- 后端服务器状态卡片 -->
+      <div class="card fade-in" style="animation-delay:0.1s;">
+        <div class="card-header">
+          <h2><span class="icon server-icon"><i class="fas fa-server"></i></span> 后端服务器状态</h2>
+          <div><span style="color:var(--text-secondary);font-size:14px;">总计: <span id="total-backends">${backends.length}</span> 个</span></div>
+        </div>
+        <div id="backend-stats-container">
+          ${backends.length > 0 ? `
+            <div class="stats-table-container">
+              <table class="stats-table">
+                <thead>
+                  <tr>
+                    <th>后端地址 / 健康</th>
+                    <th>请求统计</th>
+                    <th>性能指标</th>
+                    <th>权重状态</th>
+                  </tr>
+                </thead>
+                <tbody id="backend-stats-body">
+                  ${backendRows}
+                </tbody>
+              </table>
+            </div>
+          ` : `
+            <div class="loading-state" id="backend-stats-loading">
+              <div class="loading-spinner"></div>
+              <p>正在加载后端服务器数据...</p>
+            </div>
+          `}
+        </div>
+      </div>
+
+      <!-- 最近请求记录卡片 -->
+      <div class="card fade-in" style="animation-delay:0.2s;">
+        <div class="card-header">
+          <h2><span class="icon history-icon"><i class="fas fa-history"></i></span> 最近请求记录</h2>
+          <div><span style="color:var(--text-secondary);font-size:14px;">最近20条记录</span></div>
+        </div>
+        <div id="recent-requests-container">
+          ${requests.length > 0 ? `
+            <div class="stats-table-container">
+              <table class="stats-table">
+                <thead>
+                  <tr>
+                    <th>后端地址</th>
+                    <th>状态</th>
+                    <th>动态权重</th>
+                    <th>响应时间</th>
+                    <th>请求时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${requestRows}
+                </tbody>
+              </table>
+            </div>
+          ` : `
+            <div class="loading-state" id="recent-requests-loading">
+              <div class="loading-spinner"></div>
+              <p>正在加载请求记录...</p>
+            </div>
+          `}
+        </div>
+      </div>
+    </div>
+
+    <!-- 系统信息卡片 -->
+    <div class="card fade-in" style="animation-delay:0.3s; margin-top:25px;">
+      <div class="card-header">
+        <h2><span class="icon" style="background:linear-gradient(135deg,#f093fb 0%,#f5576c 100%); color:white;"><i class="fas fa-info-circle"></i></span> 系统信息</h2>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:20px;">
+        <div>
+          <h3 style="color:var(--text-secondary); font-size:14px; margin-bottom:8px;">权重算法</h3>
+          <p style="font-size:16px; font-weight:500;">综合 EWMA 成功率、响应时间、连续失败次数</p>
+          <p style="font-size:13px; color:var(--text-secondary);">范围: ${config.MIN_WEIGHT} - ${config.MAX_WEIGHT}</p>
+        </div>
+        <div>
+          <h3 style="color:var(--text-secondary); font-size:14px; margin-bottom:8px;">最近活动</h3>
+          <p style="font-size:16px; font-weight:500;" id="last-update-time">${formatBeijingTimeForHTML(new Date().toISOString())}</p>
+          <p style="font-size:13px; color:var(--text-secondary);">每120秒自动刷新</p>
+        </div>
+        <div>
+          <h3 style="color:var(--text-secondary); font-size:14px; margin-bottom:8px;">数据统计</h3>
+          <p style="font-size:16px; font-weight:500;">保留最近 <strong>100</strong> 条日志</p>
+          <p style="font-size:13px; color:var(--text-secondary);">超时时间: ${config.REQUEST_TIMEOUT}ms</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 工具函数
+    function formatBeijingTime(isoString) {
+      if (!isoString) return '从未';
+      try {
+        return new Date(isoString).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit' });
+      } catch { return isoString; }
+    }
+    function formatResponseTime(ms) {
+      if (!ms || ms < 0) return '0ms';
+      return ms < 1000 ? ms.toFixed(0) + 'ms' : (ms/1000).toFixed(2) + 's';
+    }
+
+    // 调试系统
+    let debugEnabled = localStorage.getItem('debugEnabled') === 'true';
+    let debugLogs = JSON.parse(localStorage.getItem('debugLogs') || '[]');
+    function addDebugLog(message, data = null) {
+      const timestamp = new Date().toLocaleString('zh-CN');
+      const logEntry = { timestamp, message, data: data ? JSON.stringify(data).substring(0,200) : null };
+      debugLogs.unshift(logEntry);
+      if (debugLogs.length > 50) debugLogs.pop();
+      localStorage.setItem('debugLogs', JSON.stringify(debugLogs));
+      if (debugEnabled) updateDebugPanel();
+    }
+    function updateDebugPanel() {
+      const debugContent = document.getElementById('debug-content');
+      if (!debugContent) return;
+      debugContent.innerHTML = debugLogs.map(log => \`
+        <div class="debug-log">
+          <div style="color:#81e6d9;font-size:11px;">\${log.timestamp}</div>
+          <div>\${log.message}</div>
+          \${log.data ? '<div style="color:#a0aec0;font-size:10px;">'+log.data+'</div>' : ''}
+        </div>\`).join('');
+    }
+    function clearDebugLogs() { debugLogs = []; localStorage.setItem('debugLogs', JSON.stringify(debugLogs)); updateDebugPanel(); }
+    function toggleDebug() {
+      debugEnabled = !debugEnabled;
+      localStorage.setItem('debugEnabled', debugEnabled);
+      document.getElementById('debug-panel').style.display = debugEnabled ? 'block' : 'none';
+      if (debugEnabled) updateDebugPanel();
+    }
+
+    // 数据加载
+    async function loadBackendStats() {
+      addDebugLog('开始加载后端统计');
+      const container = document.getElementById('backend-stats-container');
+      container.innerHTML = '<div class="loading-state"><div class="loading-spinner"></div><p>正在加载后端服务器数据...</p></div>';
+      try {
+        const res = await fetch('/api/backend-stats?_t='+Date.now());
+        if (!res.ok) throw new Error(\`HTTP \${res.status}\`);
+        const data = await res.json();
+        addDebugLog('后端统计接收', { count: data.length });
+        if (!data.length) {
+          container.innerHTML = '<div class="empty-state"><i class="fas fa-server"></i><h3>暂无后端服务器</h3><button class="btn btn-primary" onclick="location.href=\\'/init\\'"><i class="fas fa-cog"></i> 前往设置</button></div>';
+          return;
+        }
+        document.getElementById('total-backends').textContent = data.length;
+        let html = '<div class="stats-table-container"><table class="stats-table"><thead><tr><th>后端地址 / 健康</th><th>请求统计</th><th>性能指标</th><th>权重状态</th></tr></thead><tbody>';
+        data.forEach(b => {
+          const total = b.total_requests || 0;
+          const success = b.success_count || 0;
+          const fail = b.fail_count || 0;
+          const rate = total ? ((success/total)*100).toFixed(1) : '0.0';
+          const avgRT = b.average_response_time || 0;
+          const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
+          const consec = b.consecutive_failures || 0;
+          const healthy = b.healthy === 1;
+          const dynamicWeight = b.dynamic_weight || b.weight || ${config.INITIAL_WEIGHT};
+          html += \`<tr>
+            <td data-label="后端地址">
+              <div class="mobile-row"><strong>\${b.url || '未知'}</strong></div>
+              <div style="display:flex;flex-wrap:wrap;gap:6px;"><span class="healthy-badge \${healthy ? 'healthy-true' : 'healthy-false'}">\${healthy ? '健康' : '不健康'}</span>\${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}</div>
+              <div style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">\${b.url || '未知'}</div>
+            </td>
+            <td data-label="请求统计">
+              <div><small>总请求: \${total}</small></div>
+              <div><small>成功: \${success} | 失败: \${fail}</small></div>
+              <div><small>成功率: \${rate}%</small></div>
+              <div class="progress-container"><div class="progress-bar" style="width:\${Math.min(rate,100)}%"></div></div>
+            </td>
+            <td data-label="性能指标">
+              <div><small>平均响应: \${formatResponseTime(avgRT)}</small></div>
+              <div><small>最后响应: \${formatResponseTime(b.last_response_time || 0)}</small></div>
+              <div><small>EWMA成功率: \${ewma}</small></div>
+              <div><small>连续失败: \${consec}</small></div>
+            </td>
+            <td data-label="权重状态">
+              <div><small>基础权重: \${b.weight || ${config.INITIAL_WEIGHT}}</small></div>
+              <div><small>动态权重: \${dynamicWeight.toFixed(1)}</small></div>
+              <div><small>最后使用: \${b.last_used ? formatBeijingTime(b.last_used) : '从未'}</small></div>
+              <div><small>最后健康检查: \${b.last_health_check ? formatBeijingTime(b.last_health_check) : '从未'}</small></div>
+            </td>
+          </tr>\`;
+        });
+        html += '</tbody></table></div>';
+        container.innerHTML = html;
+      } catch (e) {
+        addDebugLog('加载后端统计失败', { error: e.message });
+        container.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i><h3>加载失败</h3><p>'+e.message+'</p><button class="btn btn-primary" onclick="loadBackendStats()"><i class="fas fa-redo"></i> 重新加载</button></div>';
+      }
+    }
+
+    async function loadRecentRequests() {
+      addDebugLog('开始加载最近请求');
+      const container = document.getElementById('recent-requests-container');
+      container.innerHTML = '<div class="loading-state"><div class="loading-spinner"></div><p>正在加载请求记录...</p></div>';
+      try {
+        const res = await fetch('/api/recent-requests?_t='+Date.now());
+        if (!res.ok) throw new Error(\`HTTP \${res.status}\`);
+        const data = await res.json();
+        addDebugLog('最近请求接收', { count: data.length });
+        if (!data.length) {
+          container.innerHTML = '<div class="empty-state"><i class="fas fa-history"></i><h3>暂无请求记录</h3><p>系统尚未处理任何请求</p></div>';
+          return;
+        }
+        let html = '<div class="stats-table-container"><table class="stats-table"><thead><tr><th>后端地址</th><th>状态</th><th>动态权重</th><th>响应时间</th><th>请求时间</th></tr></thead><tbody>';
+        data.forEach(r => {
+          const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
+          const statusText = r.status === 'success' ? '成功' : '失败';
+          const weight = r.dynamic_weight || 0;
+          const level = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
+          html += \`<tr>
+            <td data-label="后端地址"><div class="mobile-row"><strong>\${r.backend_url || '未知'}</strong></div><div style="max-width:180px;overflow:hidden;text-overflow:ellipsis;">\${r.backend_url || '未知'}</div></td>
+            <td data-label="状态"><span class="status-badge \${statusClass}">\${statusText}</span>\${r.error_message ? '<div><small style="color:#718096;font-size:11px;">'+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</small></div>' : ''}</td>
+            <td data-label="动态权重"><div class="weight-info"><span class="weight-badge">\${weight.toFixed(1)}</span><div class="weight-label">\${level}权重</div></div></td>
+            <td data-label="响应时间">\${formatResponseTime(r.response_time || 0)}</td>
+            <td data-label="请求时间">\${formatBeijingTime(r.request_time || new Date().toISOString())}</td>
+          </tr>\`;
+        });
+        html += '</tbody></table></div>';
+        container.innerHTML = html;
+      } catch (e) {
+        addDebugLog('加载最近请求失败', { error: e.message });
+        container.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i><h3>加载失败</h3><p>'+e.message+'</p><button class="btn btn-primary" onclick="loadRecentRequests()"><i class="fas fa-redo"></i> 重新加载</button></div>';
+      }
+    }
+
+    function refreshData() {
+      addDebugLog('手动刷新数据');
+      document.getElementById('last-update-time').textContent = formatBeijingTime(new Date().toISOString());
+      loadBackendStats();
+      loadRecentRequests();
+    }
+
+    // 初始化
+    document.addEventListener('DOMContentLoaded', () => {
+      addDebugLog('页面加载完成');
+      if (debugEnabled) { document.getElementById('debug-panel').style.display = 'block'; updateDebugPanel(); }
+      document.getElementById('last-update-time').textContent = formatBeijingTime(new Date().toISOString());
+      if (${backends.length} === 0) loadBackendStats();
+      if (${requests.length} === 0) loadRecentRequests();
+      setInterval(refreshData, 120000);
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshData(); });
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && e.key === 'r') { e.preventDefault(); refreshData(); addDebugLog('快捷键刷新'); }
+      if (e.ctrlKey && e.key === 'd') { e.preventDefault(); toggleDebug(); }
+    });
+  </script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+  });
+}
+
+// ---------- 页面处理：初始化页面（与之前相同，无语法错误）----------
+async function handleInitPage(request, env) {
+  const config = getConfig(env);
+  const count = await env.DB.prepare('SELECT COUNT(*) as c FROM backend_servers').first();
+  const hasBackends = count && count.c > 0;
+
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>数据库初始化 - 订阅转换负载均衡</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+      --warning-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+      --card-bg: rgba(255,255,255,0.95);
+      --text-primary: #2d3748;
+      --text-secondary: #718096;
+      --border-color: #e2e8f0;
+      --shadow-lg: 0 20px 40px rgba(0,0,0,0.1);
+      --radius-lg: 20px;
+    }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      color: var(--text-primary);
+    }
+    .init-container {
+      background: var(--card-bg);
+      border-radius: var(--radius-lg);
+      padding: 50px;
+      max-width: 700px;
+      width: 100%;
+      box-shadow: var(--shadow-lg);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.2);
+      text-align: center;
+      animation: slideIn 0.6s ease-out;
+    }
+    @keyframes slideIn {
+      from { opacity:0; transform:translateY(30px); }
+      to { opacity:1; transform:translateY(0); }
+    }
+    .header { margin-bottom:40px; }
+    .header-icon {
+      width:80px; height:80px;
+      background: var(--primary-gradient);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin:0 auto 20px;
+      color: white;
+      font-size:32px;
+      box-shadow:0 10px 20px rgba(102,126,234,0.3);
+    }
+    h1 {
+      font-size:32px;
+      font-weight:700;
+      background: var(--primary-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom:12px;
+    }
+    .subtitle { color:var(--text-secondary); font-size:16px; max-width:500px; margin:0 auto; }
+    .status-card {
+      background: linear-gradient(135deg, #f8fafc 0%, #edf2f7 100%);
+      border-radius:16px;
+      padding:30px;
+      margin:30px 0;
+      text-align:left;
+      border:1px solid var(--border-color);
+    }
+    .status-card h2 {
+      color:var(--text-primary);
+      margin-bottom:25px;
+      display:flex;
+      align-items:center;
+      gap:12px;
+      font-size:20px;
+    }
+    .status-card h2 i {
+      width:36px; height:36px;
+      background: var(--primary-gradient);
+      border-radius:10px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      color:white;
+      font-size:16px;
+    }
+    .status-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit, minmax(250px,1fr));
+      gap:20px;
+    }
+    .status-item {
+      padding:20px;
+      background:white;
+      border-radius:12px;
+      border:1px solid var(--border-color);
+      transition:transform 0.3s ease, box-shadow 0.3s ease;
+    }
+    .status-item:hover { transform:translateY(-3px); box-shadow:0 10px 20px rgba(0,0,0,0.1); }
+    .status-label {
+      color:var(--text-secondary);
+      font-size:14px;
+      font-weight:500;
+      margin-bottom:8px;
+      display:flex;
+      align-items:center;
+      gap:8px;
+    }
+    .status-value {
+      color:var(--text-primary);
+      font-size:24px;
+      font-weight:700;
+      margin-bottom:4px;
+    }
+    .status-value.success { color:#38a169; }
+    .status-value.warning { color:#d69e2e; }
+    .status-hint { color:var(--text-secondary); font-size:13px; }
+    .backend-list {
+      background:white;
+      border-radius:12px;
+      padding:25px;
+      margin:30px 0;
+      border:1px solid var(--border-color);
+      max-height:300px;
+      overflow-y:auto;
+    }
+    .backend-list h3 {
+      color:var(--text-primary);
+      margin-bottom:20px;
+      display:flex;
+      align-items:center;
+      gap:10px;
+      font-size:18px;
+    }
+    .backend-list h3 i { color:#667eea; }
+    .backend-url {
+      padding:12px 15px;
+      background:#f7fafc;
+      border-radius:8px;
+      margin-bottom:10px;
+      display:flex;
+      align-items:center;
+      gap:12px;
+      transition:background 0.3s ease;
+    }
+    .backend-url:hover { background:#edf2f7; }
+    .backend-url i { color:#667eea; font-size:14px; min-width:20px; }
+    .backend-url span { color:var(--text-primary); font-size:14px; word-break:break-all; }
+    .message {
+      padding:20px;
+      border-radius:12px;
+      margin:25px 0;
+      display:none;
+      animation:fadeIn 0.5s ease;
+      text-align:left;
+    }
+    @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+    .message.success {
+      background: linear-gradient(135deg, #c6f6d5 0%, #9ae6b4 100%);
+      color: #22543d;
+      border: 1px solid #9ae6b4;
+      display:block;
+    }
+    .message.error {
+      background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
+      color: #742a2a;
+      border: 1px solid #feb2b2;
+      display:block;
+    }
+    .message-content { display:flex; align-items:center; gap:15px; }
+    .message-icon { font-size:24px; flex-shrink:0; }
+    .btn-group { display:flex; flex-direction:column; gap:15px; margin-top:30px; }
+    .btn {
+      padding:18px 30px;
+      border:none;
+      border-radius:12px;
+      font-size:16px;
+      font-weight:600;
+      cursor:pointer;
+      transition:all 0.3s ease;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:12px;
+      text-decoration:none;
+      width:100%;
+    }
+    .btn-primary {
+      background: var(--primary-gradient);
+      color:white;
+      box-shadow:0 4px 15px rgba(102,126,234,0.4);
+    }
+    .btn-primary:hover:not(:disabled) { transform:translateY(-3px); box-shadow:0 8px 25px rgba(102,126,234,0.5); }
+    .btn-primary:disabled { opacity:0.7; cursor:not-allowed; transform:none; }
+    .btn-secondary {
+      background: white;
+      color: var(--text-primary);
+      border:2px solid var(--border-color);
+    }
+    .btn-secondary:hover { background:#f7fafc; transform:translateY(-3px); box-shadow:0 4px 15px rgba(0,0,0,0.1); }
+    .btn-warning {
+      background: var(--warning-gradient);
+      color: white;
+      box-shadow:0 4px 15px rgba(245,87,108,0.4);
+    }
+    .btn-warning:hover { transform:translateY(-3px); box-shadow:0 8px 25px rgba(245,87,108,0.5); }
+    .modal-overlay {
+      position: fixed;
+      top:0; left:0; right:0; bottom:0;
+      background: rgba(0,0,0,0.7);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index:1000;
+      backdrop-filter: blur(5px);
+      animation:fadeIn 0.3s ease;
+    }
+    .modal-content {
+      background: white;
+      border-radius:20px;
+      padding:40px;
+      max-width:500px;
+      width:90%;
+      box-shadow:0 25px 50px rgba(0,0,0,0.3);
+      animation:slideIn 0.4s ease;
+    }
+    .modal-header { text-align:center; margin-bottom:25px; }
+    .modal-icon {
+      width:70px; height:70px;
+      background: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);
+      border-radius:50%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      margin:0 auto 20px;
+      color:white;
+      font-size:28px;
+      box-shadow:0 10px 20px rgba(245,87,108,0.3);
+    }
+    .modal-title { font-size:24px; font-weight:700; color:#e53e3e; margin-bottom:10px; }
+    .modal-body { color:var(--text-primary); line-height:1.6; margin-bottom:30px; text-align:center; }
+    .modal-warning {
+      background: linear-gradient(135deg, #fff5f5 0%, #fed7d7 100%);
+      border-radius:12px;
+      padding:20px;
+      margin:20px 0;
+      border:1px solid #feb2b2;
+      text-align:left;
+    }
+    .modal-warning h4 { color:#742a2a; margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+    .modal-warning ul { list-style:none; padding:0; margin:10px 0; }
+    .modal-warning li { padding:8px 0; color:#742a2a; display:flex; align-items:center; gap:10px; }
+    .modal-warning li i { color:#e53e3e; font-size:12px; }
+    .modal-actions { display:flex; gap:15px; justify-content:center; }
+    .modal-btn {
+      padding:15px 30px;
+      border:none;
+      border-radius:10px;
+      font-size:16px;
+      font-weight:600;
+      cursor:pointer;
+      transition:all 0.3s ease;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:10px;
+      flex:1;
+    }
+    .modal-btn-cancel {
+      background: white;
+      color: var(--text-primary);
+      border:2px solid var(--border-color);
+    }
+    .modal-btn-cancel:hover { background:#f7fafc; transform:translateY(-2px); box-shadow:0 4px 15px rgba(0,0,0,0.1); }
+    .modal-btn-confirm {
+      background: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);
+      color: white;
+      box-shadow:0 4px 15px rgba(245,87,108,0.4);
+    }
+    .modal-btn-confirm:hover { transform:translateY(-2px); box-shadow:0 8px 25px rgba(245,87,108,0.5); }
+    .spinner { animation:spin 1s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    @media (max-width:768px) {
+      .init-container { padding:30px 20px; }
+      h1 { font-size:26px; }
+      .header-icon { width:60px; height:60px; font-size:24px; }
+      .status-grid { grid-template-columns:1fr; }
+      .btn { padding:16px 20px; font-size:15px; }
+      .modal-content { padding:30px 20px; width:95%; }
+      .modal-actions { flex-direction:column; }
+      .modal-btn { width:100%; }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --card-bg: rgba(45,55,72,0.95);
+        --text-primary: #f7fafc;
+        --text-secondary: #a0aec0;
+        --border-color: #4a5568;
+      }
+      body { background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); }
+      .status-card { background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%); }
+      .status-item { background: #2d3748; }
+      .backend-list { background: #2d3748; }
+      .backend-url { background: #4a5568; }
+      .backend-url:hover { background: #5a6778; }
+      .btn-secondary { background: #4a5568; color: #f7fafc; }
+      .btn-secondary:hover { background: #5a6778; }
+      .modal-content { background: #2d3748; }
+      .modal-warning { background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%); border:1px solid #742a2a; }
+      .modal-warning h4, .modal-warning li { color: #feb2b2; }
+      .modal-btn-cancel { background: #4a5568; color: #f7fafc; border-color:#4a5568; }
+      .modal-btn-cancel:hover { background: #5a6778; }
+    }
+  </style>
+</head>
+<body>
+  <div class="init-container">
+    <div class="header">
+      <div class="header-icon"><i class="fas fa-database"></i></div>
+      <h1>数据库初始化</h1>
+      <p class="subtitle">订阅转换负载均衡系统的数据库配置与管理</p>
+    </div>
+    <div class="status-card">
+      <h2><i class="fas fa-info-circle"></i> 当前系统状态</h2>
+      <div class="status-grid">
+        <div class="status-item">
+          <div class="status-label"><i class="fas fa-table"></i> 数据库表状态</div>
+          <div class="status-value success">已就绪</div>
+          <div class="status-hint">后端表和日志表已创建</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label"><i class="fas fa-server"></i> 后端服务器</div>
+          <div class="status-value ${hasBackends ? 'success' : 'warning'}">${hasBackends ? `已配置 (${count.c}个)` : '未配置'}</div>
+          <div class="status-hint">${hasBackends ? '系统已准备就绪' : '需要初始化后端服务器'}</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label"><i class="fas fa-cogs"></i> 默认配置</div>
+          <div class="status-value">${config.DEFAULT_BACKENDS.length} 个</div>
+          <div class="status-hint">预设后端服务器地址</div>
+        </div>
+      </div>
+    </div>
+    <div class="backend-list">
+      <h3><i class="fas fa-list"></i> 默认后端服务器列表</h3>
+      ${config.DEFAULT_BACKENDS.map(url => `<div class="backend-url"><i class="fas fa-link"></i><span>${url}</span></div>`).join('')}
+    </div>
+    <div id="message" class="message"></div>
+    <div class="btn-group">
+      ${!hasBackends ? `
+        <button id="init-btn" class="btn btn-primary" onclick="initializeDatabase()"><i class="fas fa-play-circle"></i> 初始化数据库（添加默认后端）</button>
+        <button class="btn btn-secondary" onclick="location.href='/status'"><i class="fas fa-arrow-left"></i> 返回状态页面</button>
+      ` : `
+        <button class="btn btn-primary" onclick="location.href='/status'"><i class="fas fa-chart-bar"></i> 前往状态监控面板</button>
+        <button class="btn btn-warning" onclick="showResetModal()"><i class="fas fa-redo"></i> 重置数据库</button>
+        <button class="btn btn-secondary" onclick="location.href='/'"><i class="fas fa-home"></i> 返回首页</button>
+      `}
+    </div>
+  </div>
+
+  <div id="reset-modal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="modal-icon"><i class="fas fa-exclamation-triangle"></i></div>
+        <h3 class="modal-title">确认重置数据库</h3>
+      </div>
+      <div class="modal-body">
+        <p>此操作将删除所有现有数据，包括：</p>
+        <div class="modal-warning">
+          <h4><i class="fas fa-skull-crossbones"></i> 将被删除的数据</h4>
+          <ul>
+            <li><i class="fas fa-times-circle"></i> 所有后端服务器配置</li>
+            <li><i class="fas fa-times-circle"></i> 所有请求历史记录</li>
+            <li><i class="fas fa-times-circle"></i> 所有性能统计数据</li>
+          </ul>
+        </div>
+        <p><strong>重置后系统将恢复到默认配置（${config.DEFAULT_BACKENDS.length}个后端服务器）。</strong></p>
+        <p style="color:var(--text-secondary); font-size:14px; margin-top:15px;">此操作不可撤销，请谨慎操作！</p>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-cancel" onclick="closeResetModal()"><i class="fas fa-times"></i> 取消操作</button>
+        <button class="modal-btn modal-btn-confirm" onclick="resetDatabase()"><i class="fas fa-check"></i> 确认重置</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function showResetModal() { document.getElementById('reset-modal').style.display = 'flex'; document.body.style.overflow = 'hidden'; }
+    function closeResetModal() { document.getElementById('reset-modal').style.display = 'none'; document.body.style.overflow = 'auto'; }
+    document.getElementById('reset-modal').addEventListener('click', function(e) { if (e.target === this) closeResetModal(); });
+
+    function showMessage(text, type, icon = 'info-circle') {
+      const msg = document.getElementById('message');
+      msg.className = 'message ' + type;
+      msg.innerHTML = \`<div class="message-content"><div class="message-icon"><i class="fas fa-\${icon}"></i></div><div>\${text}</div></div>\`;
+      msg.style.display = 'block';
+      if (type === 'success') setTimeout(() => msg.style.display = 'none', 5000);
+    }
+
+    async function initializeDatabase() {
+      const btn = document.getElementById('init-btn');
+      const original = btn.innerHTML;
+      btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner spinner"></i> 正在初始化...';
+      try {
+        showMessage('正在初始化数据库，请稍候...', 'success', 'spinner');
+        const res = await fetch('/api/init-db', { method: 'POST' });
+        const result = await res.json();
+        if (result.success) {
+          showMessage(\`<strong>数据库初始化成功！</strong><br>成功添加了 \${result.backends_added} 个后端服务器。\${result.errors.length ? ' ('+result.errors.length+'个失败)' : ''}<br>页面将在 3 秒后自动跳转...\`, 'success', 'check-circle');
+          setTimeout(() => location.href = '/status', 3000);
+        } else {
+          showMessage(\`<strong>初始化失败！</strong><br>错误信息: \${result.error || '未知错误'}\`, 'error', 'times-circle');
+          btn.disabled = false; btn.innerHTML = original;
+        }
+      } catch (e) {
+        showMessage(\`<strong>请求失败！</strong><br>网络错误: \${e.message}\`, 'error', 'times-circle');
+        btn.disabled = false; btn.innerHTML = original;
+      }
+    }
+
+    async function resetDatabase() {
+      closeResetModal();
+      try {
+        showMessage('正在重置数据库，请稍候...', 'success', 'spinner');
+        const res = await fetch('/api/init-db', { method: 'POST' });
+        const result = await res.json();
+        if (result.success) {
+          showMessage(\`<strong>数据库重置成功！</strong><br>已重新添加 \${result.backends_added} 个后端服务器。<br>页面将在 2 秒后刷新...\`, 'success', 'check-circle');
+          setTimeout(() => location.reload(), 2000);
+        } else {
+          showMessage(\`<strong>重置失败！</strong><br>错误信息: \${result.error || '未知错误'}\`, 'error', 'times-circle');
+        }
+      } catch (e) {
+        showMessage(\`<strong>请求失败！</strong><br>网络错误: \${e.message}\`, 'error', 'times-circle');
+      }
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && ${!hasBackends}) { const btn = document.getElementById('init-btn'); if (btn && !btn.disabled) initializeDatabase(); }
+      if (e.key === 'Escape') { if (document.getElementById('reset-modal').style.display === 'flex') closeResetModal(); else location.href = '/status'; }
+    });
+    document.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('.status-item').forEach((item,i) => { item.style.animation = 'slideIn 0.5s ease-out forwards'; item.style.animationDelay = i*0.1+'s'; });
+    });
+  </script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+  });
+}
+
+// ---------- 辅助格式化函数（用于 HTML 插值）----------
 function formatResponseTimeForHTML(ms) {
   if (!ms || ms < 0) return '0ms';
-  if (ms < 1000) return ms.toFixed(0) + 'ms';
-  return (ms / 1000).toFixed(2) + 's';
+  return ms < 1000 ? ms.toFixed(0) + 'ms' : (ms / 1000).toFixed(2) + 's';
 }
 
 function formatBeijingTimeForHTML(isoString) {
   if (!isoString) return '从未';
   try {
-    const date = new Date(isoString);
-    const beijingTime = new Date(date.getTime());
-    return beijingTime.toLocaleString('zh-CN', { 
-      timeZone: 'Asia/Shanghai',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    });
-  } catch (e) {
+    return new Date(isoString).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch {
     return isoString;
   }
 }
 
-// 初始化页面
-async function handleInitPage(request, env) {
-  logInfo('处理初始化页面请求');
-  
-  // 确保数据库表存在
-  await ensureDatabaseInitialized(env);
-  
-  // 检查是否有后端数据
-  const result = await env.DB.prepare('SELECT COUNT(*) as count FROM backend_servers').first();
-  const hasBackends = result && result.count > 0;
-  const backendCount = result?.count || 0;
-  
-  logInfo(`初始化页面状态: 有后端数据 = ${hasBackends}, 数量 = ${backendCount}`);
-  
-  const html = `
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>数据库初始化 - 订阅转换负载均衡</title>
-      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-      <style>
-        :root {
-          --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-          --warning-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-          --danger-gradient: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);
-          --card-bg: rgba(255, 255, 255, 0.95);
-          --text-primary: #2d3748;
-          --text-secondary: #718096;
-          --border-color: #e2e8f0;
-          --shadow-lg: 0 20px 40px rgba(0, 0, 0, 0.1);
-          --radius-lg: 20px;
-          --weight-gradient: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); /* 权重显示渐变色 */
-        }
-        
-        * {
-          margin: 0;
-          padding: 0;
-          box-sizing: border-box;
-        }
-        
-        body {
-          font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-          background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-          min-height: 100vh;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          padding: 20px;
-          color: var(--text-primary);
-          line-height: 1.6;
-        }
-        
-        .init-container {
-          background: var(--card-bg);
-          border-radius: var(--radius-lg);
-          padding: 50px;
-          max-width: 700px;
-          width: 100%;
-          box-shadow: var(--shadow-lg);
-          backdrop-filter: blur(10px);
-          border: 1px solid rgba(255, 255, 255, 0.2);
-          text-align: center;
-          animation: slideIn 0.6s ease-out;
-        }
-        
-        @keyframes slideIn {
-          from {
-            opacity: 0;
-            transform: translateY(30px);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0);
-          }
-        }
-        
-        .header {
-          margin-bottom: 40px;
-        }
-        
-        .header-icon {
-          width: 80px;
-          height: 80px;
-          background: var(--primary-gradient);
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          margin: 0 auto 20px;
-          color: white;
-          font-size: 32px;
-          box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
-        }
-        
-        h1 {
-          font-size: 32px;
-          font-weight: 700;
-          background: var(--primary-gradient);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-          margin-bottom: 12px;
-        }
-        
-        .subtitle {
-          color: var(--text-secondary);
-          font-size: 16px;
-          max-width: 500px;
-          margin: 0 auto;
-        }
-        
-        .status-card {
-          background: linear-gradient(135deg, #f8fafc 0%, #edf2f7 100%);
-          border-radius: 16px;
-          padding: 30px;
-          margin: 30px 0;
-          text-align: left;
-          border: 1px solid var(--border-color);
-        }
-        
-        .status-card h2 {
-          color: var(--text-primary);
-          margin-bottom: 25px;
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          font-size: 20px;
-          font-weight: 600;
-        }
-        
-        .status-card h2 i {
-          width: 36px;
-          height: 36px;
-          background: var(--primary-gradient);
-          border-radius: 10px;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          color: white;
-          font-size: 16px;
-        }
-        
-        .status-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-          gap: 20px;
-        }
-        
-        .status-item {
-          padding: 20px;
-          background: white;
-          border-radius: 12px;
-          border: 1px solid var(--border-color);
-          transition: transform 0.3s ease, box-shadow 0.3s ease;
-        }
-        
-        .status-item:hover {
-          transform: translateY(-3px);
-          box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
-        }
-        
-        .status-label {
-          color: var(--text-secondary);
-          font-size: 14px;
-          font-weight: 500;
-          margin-bottom: 8px;
-          display: flex;
-          align-items: center;
-          gap: 8px;
-        }
-        
-        .status-value {
-          color: var(--text-primary);
-          font-size: 24px;
-          font-weight: 700;
-          margin-bottom: 4px;
-        }
-        
-        .status-value.success {
-          color: #38a169;
-        }
-        
-        .status-value.warning {
-          color: #d69e2e;
-        }
-        
-        .status-value.error {
-          color: #e53e3e;
-        }
-        
-        .status-hint {
-          color: var(--text-secondary);
-          font-size: 13px;
-        }
-        
-        .backend-list {
-          background: white;
-          border-radius: 12px;
-          padding: 25px;
-          margin: 30px 0;
-          border: 1px solid var(--border-color);
-          max-height: 300px;
-          overflow-y: auto;
-        }
-        
-        .backend-list h3 {
-          color: var(--text-primary);
-          margin-bottom: 20px;
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          font-size: 18px;
-          font-weight: 600;
-        }
-        
-        .backend-list h3 i {
-          color: #667eea;
-        }
-        
-        .backend-url {
-          padding: 12px 15px;
-          background: #f7fafc;
-          border-radius: 8px;
-          margin-bottom: 10px;
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          transition: background 0.3s ease;
-        }
-        
-        .backend-url:hover {
-          background: #edf2f7;
-        }
-        
-        .backend-url i {
-          color: #667eea;
-          font-size: 14px;
-          min-width: 20px;
-        }
-        
-        .backend-url span {
-          color: var(--text-primary);
-          font-size: 14px;
-          word-break: break-all;
-        }
-        
-        .message {
-          padding: 20px;
-          border-radius: 12px;
-          margin: 25px 0;
-          display: none;
-          animation: fadeIn 0.5s ease;
-          text-align: left;
-        }
-        
-        @keyframes fadeIn {
-          from { opacity: 0; }
-          to { opacity: 1; }
-        }
-        
-        .message.success {
-          background: linear-gradient(135deg, #c6f6d5 0%, #9ae6b4 100%);
-          color: #22543d;
-          border: 1px solid #9ae6b4;
-          display: block;
-        }
-        
-        .message.error {
-          background: linear-gradient(135deg, #fed7d7 0%, #feb2b2 100%);
-          color: #742a2a;
-          border: 1px solid #feb2b2;
-          display: block;
-        }
-        
-        .message-content {
-          display: flex;
-          align-items: center;
-          gap: 15px;
-        }
-        
-        .message-icon {
-          font-size: 24px;
-          flex-shrink: 0;
-        }
-        
-        .btn-group {
-          display: flex;
-          flex-direction: column;
-          gap: 15px;
-          margin-top: 30px;
-        }
-        
-        .btn {
-          padding: 18px 30px;
-          border: none;
-          border-radius: 12px;
-          font-size: 16px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.3s ease;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 12px;
-          text-decoration: none;
-          width: 100%;
-        }
-        
-        .btn-primary {
-          background: var(--primary-gradient);
-          color: white;
-          box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-        }
-        
-        .btn-primary:hover:not(:disabled) {
-          transform: translateY(-3px);
-          box-shadow: 0 8px 25px rgba(102, 126, 234, 0.5);
-        }
-        
-        .btn-primary:disabled {
-          opacity: 0.7;
-          cursor: not-allowed;
-          transform: none !important;
-        }
-        
-        .btn-secondary {
-          background: white;
-          color: var(--text-primary);
-          border: 2px solid var(--border-color);
-        }
-        
-        .btn-secondary:hover {
-          background: #f7fafc;
-          transform: translateY(-3px);
-          box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-        }
-        
-        .btn-warning {
-          background: var(--warning-gradient);
-          color: white;
-          box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4);
-        }
-        
-        .btn-warning:hover {
-          transform: translateY(-3px);
-          box-shadow: 0 8px 25px rgba(245, 87, 108, 0.5);
-        }
-        
-        /* 自定义模态框样式 */
-        .modal-overlay {
-          position: fixed;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          background: rgba(0, 0, 0, 0.7);
-          display: none;
-          align-items: center;
-          justify-content: center;
-          z-index: 1000;
-          backdrop-filter: blur(5px);
-          animation: fadeIn 0.3s ease;
-        }
-        
-        .modal-content {
-          background: white;
-          border-radius: 20px;
-          padding: 40px;
-          max-width: 500px;
-          width: 90%;
-          box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
-          animation: slideIn 0.4s ease;
-          position: relative;
-        }
-        
-        .modal-header {
-          text-align: center;
-          margin-bottom: 25px;
-        }
-        
-        .modal-icon {
-          width: 70px;
-          height: 70px;
-          background: var(--danger-gradient);
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          margin: 0 auto 20px;
-          color: white;
-          font-size: 28px;
-          box-shadow: 0 10px 20px rgba(245, 87, 108, 0.3);
-        }
-        
-        .modal-title {
-          font-size: 24px;
-          font-weight: 700;
-          color: #e53e3e;
-          margin-bottom: 10px;
-        }
-        
-        .modal-body {
-          color: var(--text-primary);
-          line-height: 1.6;
-          margin-bottom: 30px;
-          text-align: center;
-        }
-        
-        .modal-warning {
-          background: linear-gradient(135deg, #fff5f5 0%, #fed7d7 100%);
-          border-radius: 12px;
-          padding: 20px;
-          margin: 20px 0;
-          border: 1px solid #feb2b2;
-        }
-        
-        .modal-warning h4 {
-          color: #742a2a;
-          margin-bottom: 10px;
-          display: flex;
-          align-items: center;
-          gap: 8px;
-        }
-        
-        .modal-warning ul {
-          list-style: none;
-          padding: 0;
-          margin: 10px 0;
-        }
-        
-        .modal-warning li {
-          padding: 8px 0;
-          color: #742a2a;
-          display: flex;
-          align-items: center;
-          gap: 10px;
-        }
-        
-        .modal-warning li i {
-          color: #e53e3e;
-          font-size: 12px;
-        }
-        
-        .modal-actions {
-          display: flex;
-          gap: 15px;
-          justify-content: center;
-        }
-        
-        .modal-btn {
-          padding: 15px 30px;
-          border: none;
-          border-radius: 10px;
-          font-size: 16px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.3s ease;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 10px;
-          flex: 1;
-        }
-        
-        .modal-btn-cancel {
-          background: white;
-          color: var(--text-primary);
-          border: 2px solid var(--border-color);
-        }
-        
-        .modal-btn-cancel:hover {
-          background: #f7fafc;
-          transform: translateY(-2px);
-          box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-        }
-        
-        .modal-btn-confirm {
-          background: var(--danger-gradient);
-          color: white;
-          box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4);
-        }
-        
-        .modal-btn-confirm:hover {
-          transform: translateY(-2px);
-          box-shadow: 0 8px 25px rgba(245, 87, 108, 0.5);
-        }
-        
-        .spinner {
-          animation: spin 1s linear infinite;
-        }
-        
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
-        
-        @media (max-width: 768px) {
-          .init-container {
-            padding: 30px 20px;
-          }
-          
-          h1 {
-            font-size: 26px;
-          }
-          
-          .header-icon {
-            width: 60px;
-            height: 60px;
-            font-size: 24px;
-          }
-          
-          .status-grid {
-            grid-template-columns: 1fr;
-          }
-          
-          .btn {
-            padding: 16px 20px;
-            font-size: 15px;
-          }
-          
-          .modal-content {
-            padding: 30px 20px;
-            width: 95%;
-          }
-          
-          .modal-actions {
-            flex-direction: column;
-          }
-          
-          .modal-btn {
-            width: 100%;
-          }
-        }
-        
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --card-bg: rgba(45, 55, 72, 0.95);
-            --text-primary: #f7fafc;
-            --text-secondary: #a0aec0;
-            --border-color: #4a5568;
-          }
-          
-          body {
-            background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%);
-          }
-          
-          .status-card {
-            background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
-          }
-          
-          .status-item {
-            background: #2d3748;
-          }
-          
-          .backend-list {
-            background: #2d3748;
-          }
-          
-          .backend-url {
-            background: #4a5568;
-          }
-          
-          .backend-url:hover {
-            background: #5a6778;
-          }
-          
-          .btn-secondary {
-            background: #4a5568;
-            color: #f7fafc;
-          }
-          
-          .btn-secondary:hover {
-            background: #5a6778;
-          }
-          
-          .modal-content {
-            background: #2d3748;
-            color: #f7fafc;
-          }
-          
-          .modal-warning {
-            background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
-            border: 1px solid #742a2a;
-          }
-          
-          .modal-warning h4,
-          .modal-warning li {
-            color: #feb2b2;
-          }
-          
-          .modal-btn-cancel {
-            background: #4a5568;
-            color: #f7fafc;
-            border-color: #4a5568;
-          }
-          
-          .modal-btn-cancel:hover {
-            background: #5a6778;
-          }
-        }
-      </style>
-    </head>
-    <body>
-      <div class="init-container">
-        <div class="header">
-          <div class="header-icon">
-            <i class="fas fa-database"></i>
-          </div>
-          <h1>数据库初始化</h1>
-          <p class="subtitle">订阅转换负载均衡系统的数据库配置与管理</p>
-        </div>
-        
-        <div class="status-card">
-          <h2><i class="fas fa-info-circle"></i> 当前系统状态</h2>
-          <div class="status-grid">
-            <div class="status-item">
-              <div class="status-label">
-                <i class="fas fa-table"></i> 数据库表状态
-              </div>
-              <div class="status-value success">已就绪</div>
-              <div class="status-hint">后端表和日志表已创建</div>
-            </div>
-            
-            <div class="status-item">
-              <div class="status-label">
-                <i class="fas fa-server"></i> 后端服务器
-              </div>
-              <div class="status-value ${hasBackends ? 'success' : 'warning'}">
-                ${hasBackends ? `已配置 (${backendCount}个)` : '未配置'}
-              </div>
-              <div class="status-hint">
-                ${hasBackends ? '系统已准备就绪' : '需要初始化后端服务器'}
-              </div>
-            </div>
-            
-            <div class="status-item">
-              <div class="status-label">
-                <i class="fas fa-cogs"></i> 默认配置
-              </div>
-              <div class="status-value">${DEFAULT_BACKENDS.length} 个</div>
-              <div class="status-hint">预设后端服务器地址</div>
-            </div>
-          </div>
-        </div>
-        
-        <div class="backend-list">
-          <h3><i class="fas fa-list"></i> 默认后端服务器列表</h3>
-          ${DEFAULT_BACKENDS.map(url => `
-            <div class="backend-url">
-              <i class="fas fa-link"></i>
-              <span>${url}</span>
-            </div>
-          `).join('')}
-        </div>
-        
-        <div id="message" class="message"></div>
-        
-        <div class="btn-group">
-          ${!hasBackends ? `
-            <button id="init-btn" class="btn btn-primary" onclick="initializeDatabase()">
-              <i class="fas fa-play-circle"></i> 初始化数据库（添加默认后端）
-            </button>
-            <button class="btn btn-secondary" onclick="location.href='/status'">
-              <i class="fas fa-arrow-left"></i> 返回状态页面
-            </button>
-          ` : `
-            <button class="btn btn-primary" onclick="location.href='/status'">
-              <i class="fas fa-chart-bar"></i> 前往状态监控面板
-            </button>
-            <button class="btn btn-warning" onclick="showResetModal()">
-              <i class="fas fa-redo"></i> 重置数据库
-            </button>
-            <button class="btn btn-secondary" onclick="location.href='/'">
-              <i class="fas fa-home"></i> 返回首页
-            </button>
-          `}
-        </div>
-      </div>
-      
-      <!-- 重置数据库确认模态框 -->
-      <div id="reset-modal" class="modal-overlay">
-        <div class="modal-content">
-          <div class="modal-header">
-            <div class="modal-icon">
-              <i class="fas fa-exclamation-triangle"></i>
-            </div>
-            <h3 class="modal-title">确认重置数据库</h3>
-          </div>
-          
-          <div class="modal-body">
-            <p>此操作将删除所有现有数据，包括：</p>
-            
-            <div class="modal-warning">
-              <h4><i class="fas fa-skull-crossbones"></i> 将被删除的数据</h4>
-              <ul>
-                <li><i class="fas fa-times-circle"></i> 所有后端服务器配置</li>
-                <li><i class="fas fa-times-circle"></i> 所有请求历史记录</li>
-                <li><i class="fas fa-times-circle"></i> 所有性能统计数据</li>
-              </ul>
-            </div>
-            
-            <p><strong>重置后系统将恢复到默认配置（${DEFAULT_BACKENDS.length}个后端服务器）。</strong></p>
-            <p style="color: var(--text-secondary); font-size: 14px; margin-top: 15px;">
-              此操作不可撤销，请谨慎操作！
-            </p>
-          </div>
-          
-          <div class="modal-actions">
-            <button class="modal-btn modal-btn-cancel" onclick="closeResetModal()">
-              <i class="fas fa-times"></i> 取消操作
-            </button>
-            <button class="modal-btn modal-btn-confirm" onclick="resetDatabase()">
-              <i class="fas fa-check"></i> 确认重置
-            </button>
-          </div>
-        </div>
-      </div>
-      
-      <script>
-        // 模态框控制
-        function showResetModal() {
-          const modal = document.getElementById('reset-modal');
-          modal.style.display = 'flex';
-          document.body.style.overflow = 'hidden';
-        }
-        
-        function closeResetModal() {
-          const modal = document.getElementById('reset-modal');
-          modal.style.display = 'none';
-          document.body.style.overflow = 'auto';
-        }
-        
-        // 点击模态框外部关闭
-        document.getElementById('reset-modal').addEventListener('click', function(e) {
-          if (e.target === this) {
-            closeResetModal();
-          }
-        });
-        
-        function showMessage(text, type, icon = 'info-circle') {
-          const messageDiv = document.getElementById('message');
-          messageDiv.className = 'message ' + type;
-          messageDiv.innerHTML = \`
-            <div class="message-content">
-              <div class="message-icon">
-                <i class="fas fa-\${icon}"></i>
-              </div>
-              <div>\${text}</div>
-            </div>
-          \`;
-          messageDiv.style.display = 'block';
-          
-          // 自动隐藏成功消息
-          if (type === 'success') {
-            setTimeout(() => {
-              messageDiv.style.display = 'none';
-            }, 5000);
-          }
-        }
-        
-        async function initializeDatabase() {
-          const btn = document.getElementById('init-btn');
-          const originalHtml = btn.innerHTML;
-          
-          btn.disabled = true;
-          btn.innerHTML = '<i class="fas fa-spinner spinner"></i> 正在初始化...';
-          
-          try {
-            showMessage('正在初始化数据库，请稍候...', 'success', 'spinner');
-            
-            const response = await fetch('/api/init-db', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              }
-            });
-            
-            const result = await response.json();
-            
-            if (result.success) {
-              showMessage(
-                \`<strong>数据库初始化成功！</strong><br>
-                成功添加了 \${result.backends_added} 个后端服务器。\${result.errors.length > 0 ? ' (' + result.errors.length + '个失败)' : ''}<br>
-                页面将在 3 秒后自动跳转...\`,
-                'success',
-                'check-circle'
-              );
-              
-              setTimeout(() => {
-                location.href = '/status';
-              }, 3000);
-            } else {
-              showMessage(
-                \`<strong>初始化失败！</strong><br>
-                错误信息: \${result.error || '未知错误'}\`,
-                'error',
-                'times-circle'
-              );
-              btn.disabled = false;
-              btn.innerHTML = originalHtml;
-            }
-          } catch (error) {
-            showMessage(
-              \`<strong>请求失败！</strong><br>
-              网络错误: \${error.message}\`,
-              'error',
-              'times-circle'
-            );
-            btn.disabled = false;
-            btn.innerHTML = originalHtml;
-          }
-        }
-        
-        async function resetDatabase() {
-          closeResetModal();
-          
-          try {
-            showMessage('正在重置数据库，请稍候...', 'success', 'spinner');
-            
-            const response = await fetch('/api/init-db', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              }
-            });
-            
-            const result = await response.json();
-            
-            if (result.success) {
-              showMessage(
-                \`<strong>数据库重置成功！</strong><br>
-                已重新添加 \${result.backends_added} 个后端服务器。<br>
-                页面将在 2 秒后刷新...\`,
-                'success',
-                'check-circle'
-              );
-              
-              setTimeout(() => {
-                location.reload();
-              }, 2000);
-            } else {
-              showMessage(
-                \`<strong>重置失败！</strong><br>
-                错误信息: \${result.error || '未知错误'}\`,
-                'error',
-                'times-circle'
-              );
-            }
-          } catch (error) {
-            showMessage(
-              \`<strong>请求失败！</strong><br>
-              网络错误: \${error.message}\`,
-              'error',
-              'times-circle'
-            );
-          }
-        }
-        
-        // 添加键盘快捷键
-        document.addEventListener('keydown', (e) => {
-          // Enter 键触发初始化（如果按钮可用）
-          if (e.key === 'Enter' && ${!hasBackends}) {
-            const initBtn = document.getElementById('init-btn');
-            if (initBtn && !initBtn.disabled) {
-              initializeDatabase();
-            }
-          }
-          
-          // Escape 键关闭模态框或返回状态页面
-          if (e.key === 'Escape') {
-            const modal = document.getElementById('reset-modal');
-            if (modal.style.display === 'flex') {
-              closeResetModal();
-            } else {
-              location.href = '/status';
-            }
-          }
-        });
-        
-        // 页面加载完成动画
-        document.addEventListener('DOMContentLoaded', () => {
-          const statusItems = document.querySelectorAll('.status-item');
-          statusItems.forEach((item, index) => {
-            item.style.animationDelay = \`\${index * 0.1}s\`;
-            item.style.animation = 'slideIn 0.5s ease-out forwards';
-          });
-        });
-      </script>
-    </body>
-    </html>
-  `;
-  
-  return new Response(html, {
-    headers: {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
-    }
-  });
-}
+// ---------- 主入口 ----------
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
 
-// API: 初始化数据库
-async function handleInitDatabase(request, env) {
-  logInfo('处理数据库初始化API请求');
-  if (request.method !== 'POST') {
-    logError('数据库初始化请求方法不正确', { method: request.method });
-    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
-      status: 405,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
-  
-  try {
-    // 确保表存在
-    await ensureDatabaseInitialized(env);
-    
-    // 清空现有数据
-    logDebug('清空现有数据');
-    await env.DB.prepare('DELETE FROM backend_servers').run();
-    await env.DB.prepare('DELETE FROM request_logs').run();
-    
-    // 插入默认后端地址
-    let inserted = 0;
-    let errors = [];
-    
-    logInfo(`开始插入默认后端地址 (共${DEFAULT_BACKENDS.length}个)`);
-    for (const url of DEFAULT_BACKENDS) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Max-Age': '86400' }
+      });
+    }
+
+    if (!['/init', '/api/init-db', '/status'].includes(path)) {
       try {
-        await env.DB.prepare(`
-          INSERT INTO backend_servers (url, weight, dynamic_weight)
-          VALUES (?, ?, ?)
-        `).bind(url, INITIAL_WEIGHT, INITIAL_WEIGHT).run();
-        inserted++;
-        logDebug(`插入后端成功: ${url}`);
-      } catch (error) {
-        logError(`插入后端失败: ${url}`, error);
-        errors.push({ url, error: error.message });
-        // 继续插入其他后端
+        await ensureDatabaseInitialized(env);
+      } catch (e) {
+        logError('数据库初始化失败', e);
+        if (path === '/status') return handleStatusPage(request, env);
+        return Response.redirect(`${url.origin}/init`, 302);
       }
     }
-    
-    logInfo(`数据库初始化完成: 成功插入${inserted}个后端, 失败${errors.length}个`);
-    
-    return new Response(JSON.stringify({
-      success: true,
-      message: 'Database initialized successfully',
-      backends_added: inserted,
-      errors: errors,
-      total_backends: DEFAULT_BACKENDS.length
-    }), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-    
-  } catch (error) {
-    logError('数据库初始化错误', error);
-    return new Response(JSON.stringify({
-      success: false,
-      error: error.message,
-      stack: error.stack
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
+
+    if (path === '/sub' || path.startsWith('/sub/')) return handleSubscriptionRequest(request, env, ctx);
+    if (path === '/version') return handleVersionRequest(request, env, ctx);
+    if (path === '/status') return handleStatusPage(request, env);
+    if (path === '/init') return handleInitPage(request, env);
+    if (path === '/api/init-db') return handleInitDatabase(request, env);
+    if (path === '/api/backend-stats') return handleBackendStats(request, env);
+    if (path === '/api/recent-requests') return handleRecentRequests(request, env);
+    if (path === '/') return Response.redirect(`${url.origin}/status`, 302);
+    return handleSubscriptionRequest(request, env, ctx);
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(scheduled(event, env, ctx));
   }
-}
+};
