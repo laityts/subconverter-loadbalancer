@@ -16,7 +16,6 @@ function log(level, message, data = null, reqId = null) {
     requestId: reqId,
     ...(data && { data }),
   };
-  // 直接输出 JSON 字符串，Cloudflare 会自动收集
   console.log(JSON.stringify(logEntry));
 }
 
@@ -54,7 +53,7 @@ function getConfig(env) {
   };
 }
 
-// ---------- 数据库表结构定义（新增字段 disabled_until, health_check_failures）----------
+// ---------- 数据库表结构定义（新增复合索引）----------
 const TABLE_SCHEMAS = {
   backend_servers: {
     columns: [
@@ -69,8 +68,8 @@ const TABLE_SCHEMAS = {
       { name: 'last_response_time', type: 'REAL DEFAULT 0' },
       { name: 'ewma_success_rate', type: 'REAL DEFAULT 0.5' },
       { name: 'consecutive_failures', type: 'INTEGER DEFAULT 0' },
-      { name: 'health_check_failures', type: 'INTEGER DEFAULT 0' },   // 健康检查连续失败次数
-      { name: 'disabled_until', type: 'TIMESTAMP' },                  // 熔断禁用截止时间
+      { name: 'health_check_failures', type: 'INTEGER DEFAULT 0' },
+      { name: 'disabled_until', type: 'TIMESTAMP' },
       { name: 'last_used', type: 'TIMESTAMP' },
       { name: 'enabled', type: 'BOOLEAN DEFAULT 1' },
       { name: 'healthy', type: 'BOOLEAN DEFAULT 1' },
@@ -80,7 +79,7 @@ const TABLE_SCHEMAS = {
     ],
     indexes: [
       'CREATE INDEX IF NOT EXISTS idx_backend_servers_weight ON backend_servers(dynamic_weight DESC)',
-      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled, healthy)',
+      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled, healthy, disabled_until)', // 复合索引
       'CREATE INDEX IF NOT EXISTS idx_backend_servers_disabled ON backend_servers(disabled_until)'
     ]
   },
@@ -171,8 +170,40 @@ function computeDynamicWeight(baseWeight, ewma, avgResponseTime, consecutiveFail
   return weight;
 }
 
+// ---------- 被动健康检查触发 ----------
+async function triggerPassiveHealthCheck(env, backendId, backendUrl, config, reqId) {
+  try {
+    logInfo(`触发被动健康检查: ${backendUrl}`, null, reqId);
+    const testUrl = '/sub?target=clash&url=https://www.google.com';
+    const start = Date.now();
+    const res = await fetchWithTimeout(`${backendUrl}${testUrl}`, {}, config.REQUEST_TIMEOUT);
+    const ok = res.ok;
+    const responseTime = Date.now() - start;
+    
+    // 更新健康状态
+    await env.DB.prepare(`
+      UPDATE backend_servers 
+      SET healthy = ?, last_health_check = datetime('now'),
+          health_check_failures = ?
+      WHERE id = ?
+    `).bind(ok ? 1 : 0, ok ? 0 : 1, backendId).run();
+    
+    logInfo(`被动健康检查完成: ${backendUrl} ${ok ? '通过' : '失败'}`, { responseTime }, reqId);
+  } catch (error) {
+    logError(`被动健康检查失败: ${backendUrl}`, error, reqId);
+    // 标记为不健康
+    await env.DB.prepare(`
+      UPDATE backend_servers 
+      SET healthy = 0, last_health_check = datetime('now'),
+          health_check_failures = health_check_failures + 1
+      WHERE id = ?
+    `).bind(backendId).run();
+  }
+}
+
 // ---------- 更新后端统计（EWMA、连续失败、动态权重、熔断）----------
 async function updateBackendStats(env, backendId, backendUrl, success, responseTime, config, reqId) {
+  const startTime = Date.now();
   try {
     const record = await env.DB.prepare(`
       SELECT total_requests, success_count, fail_count, average_response_time,
@@ -196,16 +227,12 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
     // 连续失败计数
     let consecutiveFails = success ? 0 : (record.consecutive_failures || 0) + 1;
 
-    // 熔断逻辑：如果连续失败达到阈值，禁用后端
+    // 熔断逻辑
     let disabledUntil = record.disabled_until;
     const now = new Date();
     if (!success && consecutiveFails >= config.CIRCUIT_BREAKER_THRESHOLD) {
-      // 设置冷却时间
       disabledUntil = new Date(now.getTime() + config.CIRCUIT_BREAKER_TIMEOUT * 1000).toISOString();
       logInfo(`后端 ${backendUrl} 触发熔断，禁用至 ${disabledUntil}`, { consecutiveFails, threshold: config.CIRCUIT_BREAKER_THRESHOLD }, reqId);
-    } else if (success && record.disabled_until) {
-      // 如果成功且之前被禁用，但冷却时间未到，则不清除禁用状态；若已过冷却时间，自动清除（由查询时判断）
-      // 此处仅重置连续失败计数
     }
 
     const baseWeight = record.weight || config.INITIAL_WEIGHT;
@@ -222,7 +249,16 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
     `).bind(total, successCount, failCount, avgRT, responseTime,
             ewma, consecutiveFails, dynamicWeight, disabledUntil, backendId).run();
 
-    logDebug(`后端统计更新: id=${backendId}, 新动态权重=${dynamicWeight}`, null, reqId);
+    const dbTime = Date.now() - startTime;
+    logDebug(`后端统计更新完成`, { backendId, dbTime, dynamicWeight }, reqId);
+
+    // 被动健康检查：如果连续失败达到阈值（如3次），触发主动探测
+    if (!success && consecutiveFails >= 3) {
+      // 异步触发健康检查，不等待
+      triggerPassiveHealthCheck(env, backendId, backendUrl, config, reqId).catch(e => 
+        logError('被动健康检查执行失败', e, reqId)
+      );
+    }
   } catch (error) {
     logError(`更新后端统计失败: id=${backendId}`, error, reqId);
   }
@@ -230,12 +266,14 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
 
 // ---------- 记录请求日志（异步，仅插入）----------
 async function logRequest(env, data, reqId) {
+  const startTime = Date.now();
   try {
     await env.DB.prepare(`
       INSERT INTO request_logs (backend_url, response_time, status, error_message, dynamic_weight, request_time)
       VALUES (?, ?, ?, ?, ?, ?)
     `).bind(data.backend_url, data.response_time, data.status,
             data.error_message || '', data.dynamic_weight || 0, data.request_time).run();
+    logDebug(`请求日志插入成功`, { dbTime: Date.now() - startTime }, reqId);
   } catch (error) {
     logError('记录请求日志失败', error, reqId);
   }
@@ -243,6 +281,7 @@ async function logRequest(env, data, reqId) {
 
 // ---------- 定时清理旧日志（独立任务）----------
 async function cleanupOldLogs(env, config, reqId = 'cleanup') {
+  const startTime = Date.now();
   try {
     const result = await env.DB.prepare(`
       DELETE FROM request_logs 
@@ -252,7 +291,7 @@ async function cleanupOldLogs(env, config, reqId = 'cleanup') {
         LIMIT ?
       )
     `).bind(config.MAX_LOG_ENTRIES).run();
-    logInfo(`清理旧日志完成，保留 ${config.MAX_LOG_ENTRIES} 条`, { changes: result.meta?.changes }, reqId);
+    logInfo(`清理旧日志完成`, { dbTime: Date.now() - startTime, changes: result.meta?.changes }, reqId);
   } catch (error) {
     logError('清理旧日志失败', error, reqId);
   }
@@ -260,6 +299,7 @@ async function cleanupOldLogs(env, config, reqId = 'cleanup') {
 
 // ---------- 选择后端（基于动态权重加权随机，排除熔断中的后端）----------
 async function selectBackend(env, config, excludeIds = [], reqId) {
+  const startTime = Date.now();
   try {
     const now = new Date().toISOString();
     let query = `
@@ -281,7 +321,10 @@ async function selectBackend(env, config, excludeIds = [], reqId) {
     let rand = Math.random() * totalWeight;
     for (const b of backends) {
       rand -= (b.dynamic_weight || config.INITIAL_WEIGHT);
-      if (rand <= 0) return b;
+      if (rand <= 0) {
+        logDebug(`后端选择完成`, { backend: b.url, weight: b.dynamic_weight, dbTime: Date.now() - startTime }, reqId);
+        return b;
+      }
     }
     return backends[0];
   } catch (error) {
@@ -311,50 +354,77 @@ async function handleSubscriptionRequest(request, env, ctx) {
   const url = new URL(request.url);
   const maxRetries = 3;
   const triedIds = new Set();
+  const totalStart = Date.now();
 
   logInfo('收到订阅请求', { method: request.method, path: url.pathname, query: url.search }, reqId);
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const selectStart = Date.now();
     const backend = await selectBackend(env, config, Array.from(triedIds), reqId);
     if (!backend) {
       logError(`第${attempt}次尝试: 无可用后端`, null, reqId);
       break;
     }
     triedIds.add(backend.id);
+    const selectTime = Date.now() - selectStart;
 
     const backendUrl = `${backend.url}${url.pathname}${url.search}`;
     const startTime = Date.now();
     let response, errorMsg, status, statusCode;
 
     try {
+      // 精简请求头
+      const headers = new Headers();
+      const allowedHeaders = ['accept', 'accept-language', 'content-type', 'user-agent', 'authorization'];
+      for (const [key, value] of request.headers.entries()) {
+        if (allowedHeaders.includes(key.toLowerCase())) {
+          headers.set(key, value);
+        }
+      }
+
       const forwardReq = new Request(backendUrl, {
         method: request.method,
-        headers: request.headers,
+        headers: headers,
         body: request.body,
         redirect: 'manual'
       });
+
+      const fetchStart = Date.now();
       response = await fetchWithTimeout(forwardReq, {}, config.REQUEST_TIMEOUT);
+      const fetchTime = Date.now() - fetchStart;
       const responseTime = Date.now() - startTime;
       statusCode = response.status;
       const isSuccess = response.ok;
       status = isSuccess ? 'success' : 'failed';
       errorMsg = isSuccess ? '' : `HTTP ${statusCode}`;
 
-      // 异步记录日志和统计（不等待）
+      // 异步记录日志和统计（并行执行）
       ctx.waitUntil((async () => {
-        await logRequest(env, {
-          backend_url: backend.url,
-          response_time: responseTime,
-          status: status,
-          error_message: errorMsg,
-          dynamic_weight: backend.dynamic_weight,
-          request_time: new Date().toISOString()
-        }, reqId);
-        await updateBackendStats(env, backend.id, backend.url, isSuccess, responseTime, config, reqId);
+        await Promise.all([
+          logRequest(env, {
+            backend_url: backend.url,
+            response_time: responseTime,
+            status: status,
+            error_message: errorMsg,
+            dynamic_weight: backend.dynamic_weight,
+            request_time: new Date().toISOString()
+          }, reqId),
+          updateBackendStats(env, backend.id, backend.url, isSuccess, responseTime, config, reqId)
+        ]);
       })());
 
       if (isSuccess) {
-        logInfo('请求成功', { backend: backend.url, attempt, responseTime, statusCode }, reqId);
+        const totalTime = Date.now() - totalStart;
+        logInfo('请求成功', { 
+          backend: backend.url, 
+          attempt, 
+          responseTime, 
+          fetchTime,
+          selectTime,
+          totalTime,
+          statusCode 
+        }, reqId);
+        
         const headers = new Headers(response.headers);
         headers.set('Access-Control-Allow-Origin', '*');
         headers.set('Cache-Control', 'no-store');
@@ -364,16 +434,15 @@ async function handleSubscriptionRequest(request, env, ctx) {
           headers
         });
       } else {
-        // 根据状态码决定是否重试：5xx 重试，4xx 不重试
         if (statusCode >= 500 && statusCode < 600) {
-          // 指数退避延迟：100ms * 2^(attempt-1)
-          const delay = 100 * Math.pow(2, attempt - 1);
-          logInfo(`后端 ${backend.url} 返回 ${statusCode}，等待 ${delay}ms 后重试 (${attempt}/${maxRetries})`, null, reqId);
+          const delay = 100 * Math.pow(2, attempt - 1) + Math.random() * 50;
+          logInfo(`后端 ${backend.url} 返回 ${statusCode}，等待 ${delay.toFixed(0)}ms 后重试 (${attempt}/${maxRetries})`, 
+            { responseTime, fetchTime, selectTime }, reqId);
           await new Promise(resolve => setTimeout(resolve, delay));
-          continue; // 重试
+          continue;
         } else {
-          // 4xx 或其他错误，直接返回错误响应
-          logInfo(`后端 ${backend.url} 返回不可重试错误 ${statusCode}，终止`, null, reqId);
+          logInfo(`后端 ${backend.url} 返回不可重试错误 ${statusCode}，终止`, 
+            { responseTime, fetchTime, selectTime }, reqId);
           return new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
@@ -382,26 +451,29 @@ async function handleSubscriptionRequest(request, env, ctx) {
         }
       }
     } catch (error) {
-      const responseTime = Date.now() - startTime;
+      const fetchTime = Date.now() - startTime;
+      const responseTime = fetchTime;
       status = 'failed';
       errorMsg = error.name === 'AbortError' ? 'Timeout' : error.message;
 
       ctx.waitUntil((async () => {
-        await logRequest(env, {
-          backend_url: backend.url,
-          response_time: responseTime,
-          status: status,
-          error_message: errorMsg,
-          dynamic_weight: backend.dynamic_weight,
-          request_time: new Date().toISOString()
-        }, reqId);
-        await updateBackendStats(env, backend.id, backend.url, false, responseTime, config, reqId);
+        await Promise.all([
+          logRequest(env, {
+            backend_url: backend.url,
+            response_time: responseTime,
+            status: status,
+            error_message: errorMsg,
+            dynamic_weight: backend.dynamic_weight,
+            request_time: new Date().toISOString()
+          }, reqId),
+          updateBackendStats(env, backend.id, backend.url, false, responseTime, config, reqId)
+        ]);
       })());
 
-      // 网络错误或超时通常可重试
       if (attempt < maxRetries) {
-        const delay = 100 * Math.pow(2, attempt - 1);
-        logInfo(`后端 ${backend.url} 请求异常 (${errorMsg})，等待 ${delay}ms 后重试 (${attempt}/${maxRetries})`, null, reqId);
+        const delay = 100 * Math.pow(2, attempt - 1) + Math.random() * 50;
+        logInfo(`后端 ${backend.url} 请求异常 (${errorMsg})，等待 ${delay.toFixed(0)}ms 后重试 (${attempt}/${maxRetries})`, 
+          { responseTime, fetchTime, selectTime }, reqId);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       } else {
@@ -410,7 +482,8 @@ async function handleSubscriptionRequest(request, env, ctx) {
     }
   }
 
-  // 所有重试失败
+  const totalTime = Date.now() - totalStart;
+  logError('所有重试失败', { totalTime, attempts: maxRetries }, reqId);
   return new Response(JSON.stringify({ error: 'All backends failed', attempts: maxRetries }), {
     status: 503,
     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -443,7 +516,7 @@ async function handleVersionRequest(request, env, ctx) {
   return new Response('Version check failed', { status: 503 });
 }
 
-// ---------- 健康检查（定时任务，每30分钟）----------
+// ---------- 主动健康检查（定时任务，每30分钟）----------
 async function scheduledHealthCheck(env, config, ctx) {
   const reqId = 'healthcheck';
   logInfo('开始执行健康检查', null, reqId);
@@ -451,7 +524,7 @@ async function scheduledHealthCheck(env, config, ctx) {
     const backends = await env.DB.prepare(`SELECT id, url, health_check_failures FROM backend_servers WHERE enabled = 1`).all();
     if (!backends.results) return;
 
-    const testUrl = '/sub?target=clash&url=https://www.google.com'; // 轻量级测试
+    const testUrl = '/sub?target=clash&url=https://www.google.com';
     for (const backend of backends.results) {
       try {
         const start = Date.now();
@@ -462,7 +535,7 @@ async function scheduledHealthCheck(env, config, ctx) {
         if (!ok) {
           healthFailures += 1;
         } else {
-          healthFailures = 0; // 成功则重置
+          healthFailures = 0;
         }
         const healthy = healthFailures < config.HEALTH_CHECK_FAIL_THRESHOLD;
         await env.DB.prepare(`
@@ -471,9 +544,9 @@ async function scheduledHealthCheck(env, config, ctx) {
               health_check_failures = ?
           WHERE id = ?
         `).bind(healthy ? 1 : 0, healthFailures, backend.id).run();
-        logDebug(`健康检查 ${backend.url}: ${ok ? '通过' : '失败'} (连续失败 ${healthFailures})`, null, reqId);
+        logDebug(`健康检查 ${backend.url}: ${ok ? '通过' : '失败'} (连续失败 ${healthFailures})`, 
+          { responseTime }, reqId);
       } catch (e) {
-        // 异常也计入失败
         let healthFailures = (backend.health_check_failures || 0) + 1;
         const healthy = healthFailures < config.HEALTH_CHECK_FAIL_THRESHOLD;
         await env.DB.prepare(`
@@ -493,12 +566,10 @@ async function scheduledHealthCheck(env, config, ctx) {
 // ---------- 定时任务入口 ----------
 async function scheduled(event, env, ctx) {
   const config = getConfig(env);
-  const type = event.cron; // cron表达式
+  const type = event.cron;
   if (type === '*/30 * * * *') {
-    // 健康检查
     await scheduledHealthCheck(env, config, ctx);
   } else if (type === '0 * * * *') {
-    // 每小时清理旧日志
     await cleanupOldLogs(env, config, 'cron');
   }
 }
@@ -569,7 +640,7 @@ async function handleInitDatabase(request, env) {
   }
 }
 
-// ---------- 页面处理：状态页面（已适配移动端卡片）----------
+// ---------- 页面处理：状态页面（已适配移动端卡片和地址换行）----------
 async function handleStatusPage(request, env) {
   const config = getConfig(env);
   const reqId = generateRequestId();
@@ -610,7 +681,7 @@ async function handleStatusPage(request, env) {
           ${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
           ${disabledUntil ? `<span class="status-badge status-failed">熔断至 ${disabledUntil}</span>` : ''}
         </div>
-        <div style="max-width:200px; overflow:hidden; text-overflow:ellipsis;">${b.url || '未知'}</div>
+        <div style="max-width:200px; overflow:hidden; text-overflow:ellipsis; word-break:break-all;">${b.url || '未知'}</div>
       </td>
       <td data-label="请求统计">
         <div><small>总请求: ${total}</small></div>
@@ -641,7 +712,7 @@ async function handleStatusPage(request, env) {
     return `<tr>
       <td data-label="后端地址">
         <div class="mobile-row"><strong>${r.backend_url || '未知'}</strong></div>
-        <div style="max-width:180px; overflow:hidden; text-overflow:ellipsis;">${r.backend_url || '未知'}</div>
+        <div style="max-width:180px; overflow:hidden; text-overflow:ellipsis; word-break:break-all;">${r.backend_url || '未知'}</div>
       </td>
       <td data-label="状态">
         <span class="status-badge ${statusClass}">${statusText}</span>
@@ -658,7 +729,7 @@ async function handleStatusPage(request, env) {
     </tr>`;
   }).join('');
 
-  // 移动端卡片 HTML（在移动端通过媒体查询显示，桌面端隐藏）
+  // 移动端卡片 HTML
   const backendCards = backends.map(b => {
     const total = b.total_requests || 0;
     const success = b.success_count || 0;
@@ -673,7 +744,7 @@ async function handleStatusPage(request, env) {
 
     return `<div class="mobile-card">
       <div class="mobile-card-header">
-        <strong>${b.url || '未知'}</strong>
+        <strong style="word-break:break-all;">${b.url || '未知'}</strong>
         <span class="healthy-badge ${healthy ? 'healthy-true' : 'healthy-false'}">${healthy ? '健康' : '不健康'}</span>
       </div>
       <div class="mobile-card-body">
@@ -698,7 +769,7 @@ async function handleStatusPage(request, env) {
     const weightLevel = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
     return `<div class="mobile-card">
       <div class="mobile-card-header">
-        <strong>${r.backend_url || '未知'}</strong>
+        <strong style="word-break:break-all;">${r.backend_url || '未知'}</strong>
         <span class="status-badge ${statusClass}">${statusText}</span>
       </div>
       <div class="mobile-card-body">
@@ -1298,7 +1369,7 @@ async function handleStatusPage(request, env) {
                 \${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
                 \${disabledUntil ? '<span class="status-badge status-failed">熔断至 '+disabledUntil+'</span>' : ''}
               </div>
-              <div style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">\${b.url || '未知'}</div>
+              <div style="max-width:200px;overflow:hidden;text-overflow:ellipsis;word-break:break-all;">\${b.url || '未知'}</div>
             </td>
             <td data-label="请求统计">
               <div><small>总请求: \${total}</small></div>
@@ -1323,7 +1394,7 @@ async function handleStatusPage(request, env) {
           // 卡片
           cardsHtml += \`<div class="mobile-card">
             <div class="mobile-card-header">
-              <strong>\${b.url || '未知'}</strong>
+              <strong style="word-break:break-all;">\${b.url || '未知'}</strong>
               <span class="healthy-badge \${healthy ? 'healthy-true' : 'healthy-false'}">\${healthy ? '健康' : '不健康'}</span>
             </div>
             <div class="mobile-card-body">
@@ -1371,7 +1442,7 @@ async function handleStatusPage(request, env) {
           const level = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
 
           tableHtml += \`<tr>
-            <td data-label="后端地址"><div class="mobile-row"><strong>\${r.backend_url || '未知'}</strong></div><div style="max-width:180px;overflow:hidden;text-overflow:ellipsis;">\${r.backend_url || '未知'}</div></td>
+            <td data-label="后端地址"><div class="mobile-row"><strong>\${r.backend_url || '未知'}</strong></div><div style="max-width:180px;overflow:hidden;text-overflow:ellipsis;word-break:break-all;">\${r.backend_url || '未知'}</div></td>
             <td data-label="状态"><span class="status-badge \${statusClass}">\${statusText}</span>\${r.error_message ? '<div><small style="color:#718096;font-size:11px;">'+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</small></div>' : ''}</td>
             <td data-label="动态权重"><div class="weight-info"><span class="weight-badge">\${weight.toFixed(1)}</span><div class="weight-label">\${level}权重</div></div></td>
             <td data-label="响应时间">\${formatResponseTime(r.response_time || 0)}</td>
@@ -1380,7 +1451,7 @@ async function handleStatusPage(request, env) {
 
           cardsHtml += \`<div class="mobile-card">
             <div class="mobile-card-header">
-              <strong>\${r.backend_url || '未知'}</strong>
+              <strong style="word-break:break-all;">\${r.backend_url || '未知'}</strong>
               <span class="status-badge \${statusClass}">\${statusText}</span>
             </div>
             <div class="mobile-card-body">
@@ -1430,7 +1501,7 @@ async function handleStatusPage(request, env) {
   });
 }
 
-// ---------- 页面处理：初始化页面（与之前相同）----------
+// ---------- 页面处理：初始化页面（保持不变）----------
 async function handleInitPage(request, env) {
   const config = getConfig(env);
   const count = await env.DB.prepare('SELECT COUNT(*) as c FROM backend_servers').first();
@@ -1897,7 +1968,7 @@ async function handleInitPage(request, env) {
   });
 }
 
-// ---------- 辅助格式化函数（用于 HTML 插值）----------
+// ---------- 辅助格式化函数 ----------
 function formatResponseTimeForHTML(ms) {
   if (!ms || ms < 0) return '0ms';
   return ms < 1000 ? ms.toFixed(0) + 'ms' : (ms / 1000).toFixed(2) + 's';
