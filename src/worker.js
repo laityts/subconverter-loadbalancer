@@ -1273,8 +1273,9 @@ async function handleStatusPage(request, env) {
       <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:20px;">
         <div>
           <h3 style="color:var(--text-secondary); font-size:14px; margin-bottom:8px;">权重算法</h3>
-          <p style="font-size:16px; font-weight:500;">综合 EWMA 成功率、响应时间、连续失败次数</p>
-          <p style="font-size:13px; color:var(--text-secondary);">范围: ${config.MIN_WEIGHT} - ${config.MAX_WEIGHT}</p>
+          <p style="font-size:14px; font-weight:500;">动态权重 = round( 基础权重 × (0.6×EWMA + 0.2×(1−min(平均响应时间/3000,1)) + 0.2×exp(−连续失败次数)) )</p>
+          <p style="font-size:13px; color:var(--text-secondary);">EWMA = α×本次结果 + (1−α)×历史EWMA, α=0.3</p>
+          <p style="font-size:13px; color:var(--text-secondary);">权重范围: ${config.MIN_WEIGHT} - ${config.MAX_WEIGHT}</p>
         </div>
         <div>
           <h3 style="color:var(--text-secondary); font-size:14px; margin-bottom:8px;">最近活动</h3>
