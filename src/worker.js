@@ -1,26 +1,36 @@
 // Cloudflare Worker 主文件
-// 订阅转换负载均衡系统（优化版，修复构建错误）
+// 订阅转换负载均衡系统（增强版）
 
-// ---------- 工具函数 ----------
-function logDebug(message, data = null) {
-  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-  const logMessage = `[DEBUG][${timestamp}] ${message}`;
-  if (data) console.log(logMessage, JSON.stringify(data, null, 2));
-  else console.log(logMessage);
+// ---------- 工具函数：结构化日志 ----------
+let requestIdCounter = 0;
+function generateRequestId() {
+  return `${Date.now()}-${(requestIdCounter++ % 1000).toString().padStart(3, '0')}`;
 }
 
-function logError(message, error = null) {
-  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-  const errorMessage = `[ERROR][${timestamp}] ${message}`;
-  if (error) console.error(errorMessage, error.stack || error.message || error);
-  else console.error(errorMessage);
+function log(level, message, data = null, reqId = null) {
+  const timestamp = new Date().toISOString();
+  const logEntry = {
+    timestamp,
+    level,
+    message,
+    requestId: reqId,
+    ...(data && { data }),
+  };
+  // 直接输出 JSON 字符串，Cloudflare 会自动收集
+  console.log(JSON.stringify(logEntry));
 }
 
-function logInfo(message, data = null) {
-  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-  const infoMessage = `[INFO][${timestamp}] ${message}`;
-  if (data) console.log(infoMessage, JSON.stringify(data, null, 2));
-  else console.log(infoMessage);
+function logDebug(message, data = null, reqId = null) {
+  log('DEBUG', message, data, reqId);
+}
+
+function logInfo(message, data = null, reqId = null) {
+  log('INFO', message, data, reqId);
+}
+
+function logError(message, error = null, reqId = null) {
+  const errorData = error ? { error: error.message, stack: error.stack } : null;
+  log('ERROR', message, errorData, reqId);
 }
 
 // ---------- 配置读取（从环境变量）----------
@@ -30,6 +40,10 @@ function getConfig(env) {
     MAX_WEIGHT: parseInt(env.MAX_WEIGHT) || 20,
     MIN_WEIGHT: parseInt(env.MIN_WEIGHT) || 1,
     REQUEST_TIMEOUT: parseInt(env.REQUEST_TIMEOUT) || 10000,
+    MAX_LOG_ENTRIES: parseInt(env.MAX_LOG_ENTRIES) || 20,
+    CIRCUIT_BREAKER_THRESHOLD: parseInt(env.CIRCUIT_BREAKER_THRESHOLD) || 5,
+    CIRCUIT_BREAKER_TIMEOUT: parseInt(env.CIRCUIT_BREAKER_TIMEOUT) || 300, // 秒
+    HEALTH_CHECK_FAIL_THRESHOLD: parseInt(env.HEALTH_CHECK_FAIL_THRESHOLD) || 3,
     DEFAULT_BACKENDS: env.DEFAULT_BACKENDS ? JSON.parse(env.DEFAULT_BACKENDS) : [
       'https://url.v1.mk',
       'https://subapi.cmliussss.net',
@@ -40,7 +54,7 @@ function getConfig(env) {
   };
 }
 
-// ---------- 数据库表结构定义 ----------
+// ---------- 数据库表结构定义（新增字段 disabled_until, health_check_failures）----------
 const TABLE_SCHEMAS = {
   backend_servers: {
     columns: [
@@ -55,6 +69,8 @@ const TABLE_SCHEMAS = {
       { name: 'last_response_time', type: 'REAL DEFAULT 0' },
       { name: 'ewma_success_rate', type: 'REAL DEFAULT 0.5' },
       { name: 'consecutive_failures', type: 'INTEGER DEFAULT 0' },
+      { name: 'health_check_failures', type: 'INTEGER DEFAULT 0' },   // 健康检查连续失败次数
+      { name: 'disabled_until', type: 'TIMESTAMP' },                  // 熔断禁用截止时间
       { name: 'last_used', type: 'TIMESTAMP' },
       { name: 'enabled', type: 'BOOLEAN DEFAULT 1' },
       { name: 'healthy', type: 'BOOLEAN DEFAULT 1' },
@@ -64,7 +80,8 @@ const TABLE_SCHEMAS = {
     ],
     indexes: [
       'CREATE INDEX IF NOT EXISTS idx_backend_servers_weight ON backend_servers(dynamic_weight DESC)',
-      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled, healthy)'
+      'CREATE INDEX IF NOT EXISTS idx_backend_servers_enabled ON backend_servers(enabled, healthy)',
+      'CREATE INDEX IF NOT EXISTS idx_backend_servers_disabled ON backend_servers(disabled_until)'
     ]
   },
   request_logs: {
@@ -154,12 +171,12 @@ function computeDynamicWeight(baseWeight, ewma, avgResponseTime, consecutiveFail
   return weight;
 }
 
-// ---------- 更新后端统计（EWMA、连续失败、动态权重）----------
-async function updateBackendStats(env, backendId, backendUrl, success, responseTime, config) {
+// ---------- 更新后端统计（EWMA、连续失败、动态权重、熔断）----------
+async function updateBackendStats(env, backendId, backendUrl, success, responseTime, config, reqId) {
   try {
     const record = await env.DB.prepare(`
       SELECT total_requests, success_count, fail_count, average_response_time,
-             weight, ewma_success_rate, consecutive_failures
+             weight, ewma_success_rate, consecutive_failures, disabled_until
       FROM backend_servers WHERE id = ?
     `).bind(backendId).first();
     if (!record) return;
@@ -176,7 +193,20 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
     const currentSuccess = success ? 1 : 0;
     const ewma = alpha * currentSuccess + (1 - alpha) * (record.ewma_success_rate || 0.5);
 
-    const consecutiveFails = success ? 0 : (record.consecutive_failures || 0) + 1;
+    // 连续失败计数
+    let consecutiveFails = success ? 0 : (record.consecutive_failures || 0) + 1;
+
+    // 熔断逻辑：如果连续失败达到阈值，禁用后端
+    let disabledUntil = record.disabled_until;
+    const now = new Date();
+    if (!success && consecutiveFails >= config.CIRCUIT_BREAKER_THRESHOLD) {
+      // 设置冷却时间
+      disabledUntil = new Date(now.getTime() + config.CIRCUIT_BREAKER_TIMEOUT * 1000).toISOString();
+      logInfo(`后端 ${backendUrl} 触发熔断，禁用至 ${disabledUntil}`, { consecutiveFails, threshold: config.CIRCUIT_BREAKER_THRESHOLD }, reqId);
+    } else if (success && record.disabled_until) {
+      // 如果成功且之前被禁用，但冷却时间未到，则不清除禁用状态；若已过冷却时间，自动清除（由查询时判断）
+      // 此处仅重置连续失败计数
+    }
 
     const baseWeight = record.weight || config.INITIAL_WEIGHT;
     const dynamicWeight = computeDynamicWeight(baseWeight, ewma, avgRT, consecutiveFails, config);
@@ -186,40 +216,59 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
       SET total_requests = ?, success_count = ?, fail_count = ?,
           average_response_time = ?, last_response_time = ?,
           ewma_success_rate = ?, consecutive_failures = ?,
-          dynamic_weight = ?, last_used = datetime('now')
+          dynamic_weight = ?, last_used = datetime('now'),
+          disabled_until = ?
       WHERE id = ?
     `).bind(total, successCount, failCount, avgRT, responseTime,
-            ewma, consecutiveFails, dynamicWeight, backendId).run();
+            ewma, consecutiveFails, dynamicWeight, disabledUntil, backendId).run();
 
-    logDebug(`后端统计更新: id=${backendId}, 新动态权重=${dynamicWeight}`);
+    logDebug(`后端统计更新: id=${backendId}, 新动态权重=${dynamicWeight}`, null, reqId);
   } catch (error) {
-    logError(`更新后端统计失败: id=${backendId}`, error);
+    logError(`更新后端统计失败: id=${backendId}`, error, reqId);
   }
 }
 
-// ---------- 记录请求日志（异步）----------
-async function logRequest(env, data) {
+// ---------- 记录请求日志（异步，仅插入）----------
+async function logRequest(env, data, reqId) {
   try {
     await env.DB.prepare(`
       INSERT INTO request_logs (backend_url, response_time, status, error_message, dynamic_weight, request_time)
       VALUES (?, ?, ?, ?, ?, ?)
     `).bind(data.backend_url, data.response_time, data.status,
             data.error_message || '', data.dynamic_weight || 0, data.request_time).run();
-
-    await env.DB.prepare(`
-      DELETE FROM request_logs 
-      WHERE id NOT IN (SELECT id FROM request_logs ORDER BY request_time DESC LIMIT 100)
-    `).run();
   } catch (error) {
-    logError('记录请求日志失败', error);
+    logError('记录请求日志失败', error, reqId);
   }
 }
 
-// ---------- 选择后端（基于动态权重加权随机）----------
-async function selectBackend(env, config, excludeIds = []) {
+// ---------- 定时清理旧日志（独立任务）----------
+async function cleanupOldLogs(env, config, reqId = 'cleanup') {
   try {
-    let query = `SELECT id, url, dynamic_weight FROM backend_servers WHERE enabled = 1 AND healthy = 1`;
-    const params = [];
+    const result = await env.DB.prepare(`
+      DELETE FROM request_logs 
+      WHERE id NOT IN (
+        SELECT id FROM request_logs 
+        ORDER BY request_time DESC 
+        LIMIT ?
+      )
+    `).bind(config.MAX_LOG_ENTRIES).run();
+    logInfo(`清理旧日志完成，保留 ${config.MAX_LOG_ENTRIES} 条`, { changes: result.meta?.changes }, reqId);
+  } catch (error) {
+    logError('清理旧日志失败', error, reqId);
+  }
+}
+
+// ---------- 选择后端（基于动态权重加权随机，排除熔断中的后端）----------
+async function selectBackend(env, config, excludeIds = [], reqId) {
+  try {
+    const now = new Date().toISOString();
+    let query = `
+      SELECT id, url, dynamic_weight 
+      FROM backend_servers 
+      WHERE enabled = 1 AND healthy = 1 
+        AND (disabled_until IS NULL OR disabled_until < ?)
+    `;
+    const params = [now];
     if (excludeIds.length > 0) {
       query += ` AND id NOT IN (${excludeIds.map(() => '?').join(',')})`;
       params.push(...excludeIds);
@@ -236,7 +285,7 @@ async function selectBackend(env, config, excludeIds = []) {
     }
     return backends[0];
   } catch (error) {
-    logError('选择后端失败', error);
+    logError('选择后端失败', error, reqId);
     return null;
   }
 }
@@ -255,24 +304,27 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-// ---------- 处理订阅请求（含重试机制）----------
+// ---------- 处理订阅请求（含重试机制、熔断、结构化日志）----------
 async function handleSubscriptionRequest(request, env, ctx) {
+  const reqId = generateRequestId();
   const config = getConfig(env);
   const url = new URL(request.url);
   const maxRetries = 3;
   const triedIds = new Set();
 
+  logInfo('收到订阅请求', { method: request.method, path: url.pathname, query: url.search }, reqId);
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const backend = await selectBackend(env, config, Array.from(triedIds));
+    const backend = await selectBackend(env, config, Array.from(triedIds), reqId);
     if (!backend) {
-      logError(`第${attempt}次尝试: 无可用后端`);
+      logError(`第${attempt}次尝试: 无可用后端`, null, reqId);
       break;
     }
     triedIds.add(backend.id);
 
     const backendUrl = `${backend.url}${url.pathname}${url.search}`;
     const startTime = Date.now();
-    let response, errorMsg, status;
+    let response, errorMsg, status, statusCode;
 
     try {
       const forwardReq = new Request(backendUrl, {
@@ -283,9 +335,12 @@ async function handleSubscriptionRequest(request, env, ctx) {
       });
       response = await fetchWithTimeout(forwardReq, {}, config.REQUEST_TIMEOUT);
       const responseTime = Date.now() - startTime;
-      status = response.ok ? 'success' : 'failed';
-      errorMsg = response.ok ? '' : `HTTP ${response.status}`;
+      statusCode = response.status;
+      const isSuccess = response.ok;
+      status = isSuccess ? 'success' : 'failed';
+      errorMsg = isSuccess ? '' : `HTTP ${statusCode}`;
 
+      // 异步记录日志和统计（不等待）
       ctx.waitUntil((async () => {
         await logRequest(env, {
           backend_url: backend.url,
@@ -294,11 +349,12 @@ async function handleSubscriptionRequest(request, env, ctx) {
           error_message: errorMsg,
           dynamic_weight: backend.dynamic_weight,
           request_time: new Date().toISOString()
-        });
-        await updateBackendStats(env, backend.id, backend.url, status === 'success', responseTime, config);
+        }, reqId);
+        await updateBackendStats(env, backend.id, backend.url, isSuccess, responseTime, config, reqId);
       })());
 
-      if (response.ok) {
+      if (isSuccess) {
+        logInfo('请求成功', { backend: backend.url, attempt, responseTime, statusCode }, reqId);
         const headers = new Headers(response.headers);
         headers.set('Access-Control-Allow-Origin', '*');
         headers.set('Cache-Control', 'no-store');
@@ -308,7 +364,22 @@ async function handleSubscriptionRequest(request, env, ctx) {
           headers
         });
       } else {
-        logInfo(`后端 ${backend.url} 返回错误 ${response.status}，尝试重试 (${attempt}/${maxRetries})`);
+        // 根据状态码决定是否重试：5xx 重试，4xx 不重试
+        if (statusCode >= 500 && statusCode < 600) {
+          // 指数退避延迟：100ms * 2^(attempt-1)
+          const delay = 100 * Math.pow(2, attempt - 1);
+          logInfo(`后端 ${backend.url} 返回 ${statusCode}，等待 ${delay}ms 后重试 (${attempt}/${maxRetries})`, null, reqId);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue; // 重试
+        } else {
+          // 4xx 或其他错误，直接返回错误响应
+          logInfo(`后端 ${backend.url} 返回不可重试错误 ${statusCode}，终止`, null, reqId);
+          return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: { 'Access-Control-Allow-Origin': '*' }
+          });
+        }
       }
     } catch (error) {
       const responseTime = Date.now() - startTime;
@@ -323,27 +394,37 @@ async function handleSubscriptionRequest(request, env, ctx) {
           error_message: errorMsg,
           dynamic_weight: backend.dynamic_weight,
           request_time: new Date().toISOString()
-        });
-        await updateBackendStats(env, backend.id, backend.url, false, responseTime, config);
+        }, reqId);
+        await updateBackendStats(env, backend.id, backend.url, false, responseTime, config, reqId);
       })());
 
-      logInfo(`后端 ${backend.url} 请求异常 (${errorMsg})，尝试重试 (${attempt}/${maxRetries})`);
+      // 网络错误或超时通常可重试
+      if (attempt < maxRetries) {
+        const delay = 100 * Math.pow(2, attempt - 1);
+        logInfo(`后端 ${backend.url} 请求异常 (${errorMsg})，等待 ${delay}ms 后重试 (${attempt}/${maxRetries})`, null, reqId);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      } else {
+        logError(`后端 ${backend.url} 最终失败`, error, reqId);
+      }
     }
   }
 
+  // 所有重试失败
   return new Response(JSON.stringify({ error: 'All backends failed', attempts: maxRetries }), {
     status: 503,
     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
   });
 }
 
-// ---------- 处理版本请求 ----------
+// ---------- 处理版本请求（简化版）----------
 async function handleVersionRequest(request, env, ctx) {
+  const reqId = generateRequestId();
   const config = getConfig(env);
   const maxRetries = 2;
   const triedIds = new Set();
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const backend = await selectBackend(env, config, Array.from(triedIds));
+    const backend = await selectBackend(env, config, Array.from(triedIds), reqId);
     if (!backend) break;
     triedIds.add(backend.id);
     try {
@@ -356,58 +437,93 @@ async function handleVersionRequest(request, env, ctx) {
         });
       }
     } catch (e) {
-      logError(`版本请求失败 ${backend.url}`, e);
+      logError(`版本请求失败 ${backend.url}`, e, reqId);
     }
   }
   return new Response('Version check failed', { status: 503 });
 }
 
-// ---------- 健康检查（定时任务）----------
-async function scheduled(event, env, ctx) {
-  const config = getConfig(env);
-  logInfo('开始执行健康检查');
+// ---------- 健康检查（定时任务，每30分钟）----------
+async function scheduledHealthCheck(env, config, ctx) {
+  const reqId = 'healthcheck';
+  logInfo('开始执行健康检查', null, reqId);
   try {
-    const backends = await env.DB.prepare(`SELECT id, url FROM backend_servers WHERE enabled = 1`).all();
+    const backends = await env.DB.prepare(`SELECT id, url, health_check_failures FROM backend_servers WHERE enabled = 1`).all();
     if (!backends.results) return;
 
+    const testUrl = '/sub?target=clash&url=https://www.google.com'; // 轻量级测试
     for (const backend of backends.results) {
       try {
-        await fetchWithTimeout(`${backend.url}/version`, {}, config.REQUEST_TIMEOUT);
-        const ok = true;
+        const start = Date.now();
+        const res = await fetchWithTimeout(`${backend.url}${testUrl}`, {}, config.REQUEST_TIMEOUT);
+        const ok = res.ok;
+        const responseTime = Date.now() - start;
+        let healthFailures = backend.health_check_failures || 0;
+        if (!ok) {
+          healthFailures += 1;
+        } else {
+          healthFailures = 0; // 成功则重置
+        }
+        const healthy = healthFailures < config.HEALTH_CHECK_FAIL_THRESHOLD;
         await env.DB.prepare(`
           UPDATE backend_servers 
-          SET healthy = ?, last_health_check = datetime('now')
+          SET healthy = ?, last_health_check = datetime('now'),
+              health_check_failures = ?
           WHERE id = ?
-        `).bind(ok ? 1 : 0, backend.id).run();
-        logDebug(`健康检查 ${backend.url}: 通过`);
+        `).bind(healthy ? 1 : 0, healthFailures, backend.id).run();
+        logDebug(`健康检查 ${backend.url}: ${ok ? '通过' : '失败'} (连续失败 ${healthFailures})`, null, reqId);
       } catch (e) {
-        await env.DB.prepare(`UPDATE backend_servers SET healthy = 0, last_health_check = datetime('now') WHERE id = ?`).bind(backend.id).run();
-        logError(`健康检查异常 ${backend.url}`, e);
+        // 异常也计入失败
+        let healthFailures = (backend.health_check_failures || 0) + 1;
+        const healthy = healthFailures < config.HEALTH_CHECK_FAIL_THRESHOLD;
+        await env.DB.prepare(`
+          UPDATE backend_servers 
+          SET healthy = ?, last_health_check = datetime('now'),
+              health_check_failures = ?
+          WHERE id = ?
+        `).bind(healthy ? 1 : 0, healthFailures, backend.id).run();
+        logError(`健康检查异常 ${backend.url}`, e, reqId);
       }
     }
   } catch (error) {
-    logError('健康检查整体失败', error);
+    logError('健康检查整体失败', error, reqId);
+  }
+}
+
+// ---------- 定时任务入口 ----------
+async function scheduled(event, env, ctx) {
+  const config = getConfig(env);
+  const type = event.cron; // cron表达式
+  if (type === '*/30 * * * *') {
+    // 健康检查
+    await scheduledHealthCheck(env, config, ctx);
+  } else if (type === '0 * * * *') {
+    // 每小时清理旧日志
+    await cleanupOldLogs(env, config, 'cron');
   }
 }
 
 // ---------- API 处理函数 ----------
 async function handleBackendStats(request, env) {
+  const reqId = generateRequestId();
   try {
     const result = await env.DB.prepare(`
       SELECT id, url, weight, dynamic_weight, total_requests, success_count, fail_count,
              average_response_time, last_response_time, ewma_success_rate, consecutive_failures,
-             last_used, enabled, healthy, last_health_check, created_at
+             health_check_failures, disabled_until, last_used, enabled, healthy, last_health_check, created_at
       FROM backend_servers ORDER BY dynamic_weight DESC
     `).all();
     return new Response(JSON.stringify(result.results || []), {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }
     });
   } catch (error) {
+    logError('获取后端统计失败', error, reqId);
     return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 }
 
 async function handleRecentRequests(request, env) {
+  const reqId = generateRequestId();
   try {
     const result = await env.DB.prepare(`
       SELECT id, backend_url, response_time, status, error_message, dynamic_weight, request_time
@@ -417,11 +533,13 @@ async function handleRecentRequests(request, env) {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }
     });
   } catch (error) {
+    logError('获取最近请求失败', error, reqId);
     return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 }
 
 async function handleInitDatabase(request, env) {
+  const reqId = generateRequestId();
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
   const config = getConfig(env);
   try {
@@ -433,42 +551,45 @@ async function handleInitDatabase(request, env) {
     for (const url of config.DEFAULT_BACKENDS) {
       try {
         await env.DB.prepare(`
-          INSERT INTO backend_servers (url, weight, dynamic_weight, ewma_success_rate, healthy)
-          VALUES (?, ?, ?, ?, ?)
-        `).bind(url, config.INITIAL_WEIGHT, config.INITIAL_WEIGHT, 0.5, 1).run();
+          INSERT INTO backend_servers (url, weight, dynamic_weight, ewma_success_rate, healthy, health_check_failures)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).bind(url, config.INITIAL_WEIGHT, config.INITIAL_WEIGHT, 0.5, 1, 0).run();
         inserted++;
       } catch (e) {
         errors.push({ url, error: e.message });
       }
     }
+    logInfo('数据库初始化完成', { inserted, errors }, reqId);
     return new Response(JSON.stringify({ success: true, backends_added: inserted, errors }), {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   } catch (error) {
+    logError('数据库初始化失败', error, reqId);
     return new Response(JSON.stringify({ success: false, error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 }
 
-// ---------- 页面处理：状态页面（已修复语法错误）----------
+// ---------- 页面处理：状态页面（已适配移动端卡片）----------
 async function handleStatusPage(request, env) {
   const config = getConfig(env);
+  const reqId = generateRequestId();
   const [backendStats, recentRequests] = await Promise.allSettled([
     env.DB.prepare(`
       SELECT id, url, weight, dynamic_weight, total_requests, success_count, fail_count,
              average_response_time, last_response_time, ewma_success_rate, consecutive_failures,
-             last_used, enabled, healthy, last_health_check
+             health_check_failures, disabled_until, last_used, enabled, healthy, last_health_check
       FROM backend_servers ORDER BY dynamic_weight DESC LIMIT 10
     `).all(),
     env.DB.prepare(`
       SELECT backend_url, response_time, status, error_message, dynamic_weight, request_time
-      FROM request_logs ORDER BY request_time DESC LIMIT 10
+      FROM request_logs ORDER BY request_time DESC LIMIT 20
     `).all()
   ]);
 
   const backends = backendStats.value?.results || [];
   const requests = recentRequests.value?.results || [];
 
-  // 构建 HTML（确保所有变量定义在模板字符串外部，避免语法错误）
+  // 构造后端表格行（用于桌面端）和卡片数据（移动端）
   const backendRows = backends.map(b => {
     const total = b.total_requests || 0;
     const success = b.success_count || 0;
@@ -478,6 +599,7 @@ async function handleStatusPage(request, env) {
     const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
     const consecFails = b.consecutive_failures || 0;
     const healthy = b.healthy === 1;
+    const disabledUntil = b.disabled_until ? new Date(b.disabled_until).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : null;
     const dynamicWeight = b.dynamic_weight || b.weight || config.INITIAL_WEIGHT;
 
     return `<tr>
@@ -486,6 +608,7 @@ async function handleStatusPage(request, env) {
         <div style="display:flex; flex-wrap:wrap; gap:6px;">
           <span class="healthy-badge ${healthy ? 'healthy-true' : 'healthy-false'}">${healthy ? '健康' : '不健康'}</span>
           ${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
+          ${disabledUntil ? `<span class="status-badge status-failed">熔断至 ${disabledUntil}</span>` : ''}
         </div>
         <div style="max-width:200px; overflow:hidden; text-overflow:ellipsis;">${b.url || '未知'}</div>
       </td>
@@ -533,6 +656,58 @@ async function handleStatusPage(request, env) {
       <td data-label="响应时间">${formatResponseTimeForHTML(r.response_time || 0)}</td>
       <td data-label="请求时间">${formatBeijingTimeForHTML(r.request_time || new Date().toISOString())}</td>
     </tr>`;
+  }).join('');
+
+  // 移动端卡片 HTML（在移动端通过媒体查询显示，桌面端隐藏）
+  const backendCards = backends.map(b => {
+    const total = b.total_requests || 0;
+    const success = b.success_count || 0;
+    const fail = b.fail_count || 0;
+    const rate = total > 0 ? ((success / total) * 100).toFixed(1) : '0.0';
+    const avgRT = b.average_response_time || 0;
+    const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
+    const consecFails = b.consecutive_failures || 0;
+    const healthy = b.healthy === 1;
+    const disabledUntil = b.disabled_until ? new Date(b.disabled_until).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : null;
+    const dynamicWeight = b.dynamic_weight || b.weight || config.INITIAL_WEIGHT;
+
+    return `<div class="mobile-card">
+      <div class="mobile-card-header">
+        <strong>${b.url || '未知'}</strong>
+        <span class="healthy-badge ${healthy ? 'healthy-true' : 'healthy-false'}">${healthy ? '健康' : '不健康'}</span>
+      </div>
+      <div class="mobile-card-body">
+        <div><span>总请求:</span> ${total}</div>
+        <div><span>成功/失败:</span> ${success}/${fail}</div>
+        <div><span>成功率:</span> ${rate}% <span class="progress-container" style="width:60px; display:inline-block; margin-left:8px;"><div class="progress-bar" style="width:${Math.min(rate,100)}%"></div></span></div>
+        <div><span>平均响应:</span> ${formatResponseTimeForHTML(avgRT)}</div>
+        <div><span>动态权重:</span> ${dynamicWeight.toFixed(1)} (基础: ${b.weight || config.INITIAL_WEIGHT})</div>
+        <div><span>EWMA成功率:</span> ${ewma}</div>
+        <div><span>连续失败:</span> ${consecFails}</div>
+        <div><span>最后使用:</span> ${b.last_used ? formatBeijingTimeForHTML(b.last_used) : '从未'}</div>
+        ${disabledUntil ? `<div><span>熔断至:</span> ${disabledUntil}</div>` : ''}
+        <div><span>健康检查:</span> ${b.last_health_check ? formatBeijingTimeForHTML(b.last_health_check) : '从未'}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  const requestCards = requests.map(r => {
+    const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
+    const statusText = r.status === 'success' ? '成功' : '失败';
+    const weight = r.dynamic_weight || 0;
+    const weightLevel = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
+    return `<div class="mobile-card">
+      <div class="mobile-card-header">
+        <strong>${r.backend_url || '未知'}</strong>
+        <span class="status-badge ${statusClass}">${statusText}</span>
+      </div>
+      <div class="mobile-card-body">
+        <div><span>动态权重:</span> ${weight.toFixed(1)} (${weightLevel})</div>
+        <div><span>响应时间:</span> ${formatResponseTimeForHTML(r.response_time || 0)}</div>
+        <div><span>请求时间:</span> ${formatBeijingTimeForHTML(r.request_time || new Date().toISOString())}</div>
+        ${r.error_message ? `<div><span>错误:</span> ${r.error_message.substring(0,40)}${r.error_message.length>40?'...':''}</div>` : ''}
+      </div>
+    </div>`;
   }).join('');
 
   const html = `<!DOCTYPE html>
@@ -692,6 +867,7 @@ async function handleStatusPage(request, env) {
       background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
       color: white;
     }
+    /* 桌面端表格样式 */
     .stats-table-container {
       overflow-x: auto;
       border-radius: 10px;
@@ -726,6 +902,45 @@ async function handleStatusPage(request, env) {
     .stats-table td {
       padding: 18px 20px;
       color: var(--text-primary);
+    }
+    /* 移动端卡片样式 */
+    .mobile-cards {
+      display: none;
+      flex-direction: column;
+      gap: 15px;
+    }
+    .mobile-card {
+      background: white;
+      border-radius: 12px;
+      padding: 15px;
+      box-shadow: var(--shadow-sm);
+      border: 1px solid var(--border-color);
+    }
+    .mobile-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px dashed var(--border-color);
+    }
+    .mobile-card-body {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 12px;
+      font-size: 13px;
+    }
+    .mobile-card-body div {
+      display: flex;
+      flex-wrap: wrap;
+    }
+    .mobile-card-body div span:first-child {
+      color: var(--text-secondary);
+      min-width: 70px;
+    }
+    @media (max-width: 768px) {
+      .stats-table-container { display: none; }
+      .mobile-cards { display: flex; }
     }
     .status-badge {
       padding: 6px 12px;
@@ -856,55 +1071,6 @@ async function handleStatusPage(request, env) {
       to { opacity: 1; transform: translateY(0); }
     }
     .fade-in { animation: fadeIn 0.5s ease-out; }
-    @media (max-width: 768px) {
-      body { padding: 15px; }
-      .header { padding: 20px; }
-      .header-content { flex-direction: column; align-items: stretch; }
-      .action-buttons { justify-content: center; }
-      .btn { padding: 10px 16px; font-size: 13px; }
-      .stats-table { min-width: auto; }
-      .stats-table thead { display: none; }
-      .stats-table tbody tr {
-        display: block;
-        margin-bottom: 15px;
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 15px;
-      }
-      .stats-table td {
-        display: block;
-        padding: 8px 0;
-        border: none;
-      }
-      .stats-table td:before {
-        content: attr(data-label);
-        font-weight: 600;
-        color: var(--text-secondary);
-        display: block;
-        margin-bottom: 4px;
-        font-size: 12px;
-        text-transform: uppercase;
-      }
-      .mobile-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 10px;
-      }
-      #backend-stats-container .stats-table td:first-child > div:not(.mobile-row) { display: none !important; }
-      #backend-stats-container .stats-table td:first-child .mobile-row { display: block; }
-      #backend-stats-container .stats-table td:first-child .mobile-row strong {
-        display: block; word-break: break-all; font-size: 14px; color: var(--text-primary);
-      }
-      #recent-requests-container .stats-table td:first-child > div:not(.mobile-row) { display: none !important; }
-      #recent-requests-container .stats-table td:first-child .mobile-row { display: block; }
-      #recent-requests-container .stats-table td:first-child .mobile-row strong {
-        display: block; word-break: break-all; font-size: 14px; color: var(--text-primary);
-      }
-      .title-section p { text-align: center; width: 100%; }
-      .weight-badge { font-size: 12px; padding: 4px 8px; min-width: 50px; }
-      .weight-info { flex-direction: column; align-items: flex-start; gap: 5px; }
-    }
     @media (prefers-color-scheme: dark) {
       :root {
         --card-bg: rgba(45,55,72,0.95);
@@ -916,6 +1082,7 @@ async function handleStatusPage(request, env) {
       .card { border: 1px solid rgba(255,255,255,0.1); }
       .stats-table-container { background: #2d3748; }
       .stats-table tbody tr:hover { background: #4a5568; }
+      .mobile-card { background: #2d3748; }
       .progress-container { background: #4a5568; }
       .weight-badge {
         background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
@@ -957,6 +1124,7 @@ async function handleStatusPage(request, env) {
         </div>
         <div id="backend-stats-container">
           ${backends.length > 0 ? `
+            <!-- 桌面端表格 -->
             <div class="stats-table-container">
               <table class="stats-table">
                 <thead>
@@ -972,6 +1140,10 @@ async function handleStatusPage(request, env) {
                 </tbody>
               </table>
             </div>
+            <!-- 移动端卡片 -->
+            <div class="mobile-cards" id="backend-mobile-cards">
+              ${backendCards}
+            </div>
           ` : `
             <div class="loading-state" id="backend-stats-loading">
               <div class="loading-spinner"></div>
@@ -985,10 +1157,11 @@ async function handleStatusPage(request, env) {
       <div class="card fade-in" style="animation-delay:0.2s;">
         <div class="card-header">
           <h2><span class="icon history-icon"><i class="fas fa-history"></i></span> 最近请求记录</h2>
-          <div><span style="color:var(--text-secondary);font-size:14px;">最近20条记录</span></div>
+          <div><span style="color:var(--text-secondary);font-size:14px;">最近 ${config.MAX_LOG_ENTRIES} 条记录</span></div>
         </div>
         <div id="recent-requests-container">
           ${requests.length > 0 ? `
+            <!-- 桌面端表格 -->
             <div class="stats-table-container">
               <table class="stats-table">
                 <thead>
@@ -1004,6 +1177,10 @@ async function handleStatusPage(request, env) {
                   ${requestRows}
                 </tbody>
               </table>
+            </div>
+            <!-- 移动端卡片 -->
+            <div class="mobile-cards" id="recent-mobile-cards">
+              ${requestCards}
             </div>
           ` : `
             <div class="loading-state" id="recent-requests-loading">
@@ -1033,7 +1210,7 @@ async function handleStatusPage(request, env) {
         </div>
         <div>
           <h3 style="color:var(--text-secondary); font-size:14px; margin-bottom:8px;">数据统计</h3>
-          <p style="font-size:16px; font-weight:500;">保留最近 <strong>100</strong> 条日志</p>
+          <p style="font-size:16px; font-weight:500;">保留最近 <strong>${config.MAX_LOG_ENTRIES}</strong> 条日志</p>
           <p style="font-size:13px; color:var(--text-secondary);">超时时间: ${config.REQUEST_TIMEOUT}ms</p>
         </div>
       </div>
@@ -1097,7 +1274,9 @@ async function handleStatusPage(request, env) {
           return;
         }
         document.getElementById('total-backends').textContent = data.length;
-        let html = '<div class="stats-table-container"><table class="stats-table"><thead><tr><th>后端地址 / 健康</th><th>请求统计</th><th>性能指标</th><th>权重状态</th></tr></thead><tbody>';
+        // 构建表格和卡片
+        let tableHtml = '<div class="stats-table-container"><table class="stats-table"><thead><tr><th>后端地址 / 健康</th><th>请求统计</th><th>性能指标</th><th>权重状态</th></tr></thead><tbody>';
+        let cardsHtml = '<div class="mobile-cards">';
         data.forEach(b => {
           const total = b.total_requests || 0;
           const success = b.success_count || 0;
@@ -1107,11 +1286,18 @@ async function handleStatusPage(request, env) {
           const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
           const consec = b.consecutive_failures || 0;
           const healthy = b.healthy === 1;
+          const disabledUntil = b.disabled_until ? formatBeijingTime(b.disabled_until) : null;
           const dynamicWeight = b.dynamic_weight || b.weight || ${config.INITIAL_WEIGHT};
-          html += \`<tr>
+
+          // 表格行
+          tableHtml += \`<tr>
             <td data-label="后端地址">
               <div class="mobile-row"><strong>\${b.url || '未知'}</strong></div>
-              <div style="display:flex;flex-wrap:wrap;gap:6px;"><span class="healthy-badge \${healthy ? 'healthy-true' : 'healthy-false'}">\${healthy ? '健康' : '不健康'}</span>\${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}</div>
+              <div style="display:flex;flex-wrap:wrap;gap:6px;">
+                <span class="healthy-badge \${healthy ? 'healthy-true' : 'healthy-false'}">\${healthy ? '健康' : '不健康'}</span>
+                \${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
+                \${disabledUntil ? '<span class="status-badge status-failed">熔断至 '+disabledUntil+'</span>' : ''}
+              </div>
               <div style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">\${b.url || '未知'}</div>
             </td>
             <td data-label="请求统计">
@@ -1133,9 +1319,30 @@ async function handleStatusPage(request, env) {
               <div><small>最后健康检查: \${b.last_health_check ? formatBeijingTime(b.last_health_check) : '从未'}</small></div>
             </td>
           </tr>\`;
+
+          // 卡片
+          cardsHtml += \`<div class="mobile-card">
+            <div class="mobile-card-header">
+              <strong>\${b.url || '未知'}</strong>
+              <span class="healthy-badge \${healthy ? 'healthy-true' : 'healthy-false'}">\${healthy ? '健康' : '不健康'}</span>
+            </div>
+            <div class="mobile-card-body">
+              <div><span>总请求:</span> \${total}</div>
+              <div><span>成功/失败:</span> \${success}/\${fail}</div>
+              <div><span>成功率:</span> \${rate}% <span class="progress-container" style="width:60px; display:inline-block; margin-left:8px;"><div class="progress-bar" style="width:\${Math.min(rate,100)}%"></div></span></div>
+              <div><span>平均响应:</span> \${formatResponseTime(avgRT)}</div>
+              <div><span>动态权重:</span> \${dynamicWeight.toFixed(1)} (基础: \${b.weight || ${config.INITIAL_WEIGHT}})</div>
+              <div><span>EWMA成功率:</span> \${ewma}</div>
+              <div><span>连续失败:</span> \${consec}</div>
+              <div><span>最后使用:</span> \${b.last_used ? formatBeijingTime(b.last_used) : '从未'}</div>
+              \${disabledUntil ? '<div><span>熔断至:</span> '+disabledUntil+'</div>' : ''}
+              <div><span>健康检查:</span> \${b.last_health_check ? formatBeijingTime(b.last_health_check) : '从未'}</div>
+            </div>
+          </div>\`;
         });
-        html += '</tbody></table></div>';
-        container.innerHTML = html;
+        tableHtml += '</tbody></table></div>';
+        cardsHtml += '</div>';
+        container.innerHTML = tableHtml + cardsHtml;
       } catch (e) {
         addDebugLog('加载后端统计失败', { error: e.message });
         container.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i><h3>加载失败</h3><p>'+e.message+'</p><button class="btn btn-primary" onclick="loadBackendStats()"><i class="fas fa-redo"></i> 重新加载</button></div>';
@@ -1155,22 +1362,38 @@ async function handleStatusPage(request, env) {
           container.innerHTML = '<div class="empty-state"><i class="fas fa-history"></i><h3>暂无请求记录</h3><p>系统尚未处理任何请求</p></div>';
           return;
         }
-        let html = '<div class="stats-table-container"><table class="stats-table"><thead><tr><th>后端地址</th><th>状态</th><th>动态权重</th><th>响应时间</th><th>请求时间</th></tr></thead><tbody>';
+        let tableHtml = '<div class="stats-table-container"><table class="stats-table"><thead><tr><th>后端地址</th><th>状态</th><th>动态权重</th><th>响应时间</th><th>请求时间</th></tr></thead><tbody>';
+        let cardsHtml = '<div class="mobile-cards">';
         data.forEach(r => {
           const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
           const statusText = r.status === 'success' ? '成功' : '失败';
           const weight = r.dynamic_weight || 0;
           const level = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
-          html += \`<tr>
+
+          tableHtml += \`<tr>
             <td data-label="后端地址"><div class="mobile-row"><strong>\${r.backend_url || '未知'}</strong></div><div style="max-width:180px;overflow:hidden;text-overflow:ellipsis;">\${r.backend_url || '未知'}</div></td>
             <td data-label="状态"><span class="status-badge \${statusClass}">\${statusText}</span>\${r.error_message ? '<div><small style="color:#718096;font-size:11px;">'+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</small></div>' : ''}</td>
             <td data-label="动态权重"><div class="weight-info"><span class="weight-badge">\${weight.toFixed(1)}</span><div class="weight-label">\${level}权重</div></div></td>
             <td data-label="响应时间">\${formatResponseTime(r.response_time || 0)}</td>
             <td data-label="请求时间">\${formatBeijingTime(r.request_time || new Date().toISOString())}</td>
           </tr>\`;
+
+          cardsHtml += \`<div class="mobile-card">
+            <div class="mobile-card-header">
+              <strong>\${r.backend_url || '未知'}</strong>
+              <span class="status-badge \${statusClass}">\${statusText}</span>
+            </div>
+            <div class="mobile-card-body">
+              <div><span>动态权重:</span> \${weight.toFixed(1)} (\${level})</div>
+              <div><span>响应时间:</span> \${formatResponseTime(r.response_time || 0)}</div>
+              <div><span>请求时间:</span> \${formatBeijingTime(r.request_time || new Date().toISOString())}</div>
+              \${r.error_message ? '<div><span>错误:</span> '+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</div>' : ''}
+            </div>
+          </div>\`;
         });
-        html += '</tbody></table></div>';
-        container.innerHTML = html;
+        tableHtml += '</tbody></table></div>';
+        cardsHtml += '</div>';
+        container.innerHTML = tableHtml + cardsHtml;
       } catch (e) {
         addDebugLog('加载最近请求失败', { error: e.message });
         container.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i><h3>加载失败</h3><p>'+e.message+'</p><button class="btn btn-primary" onclick="loadRecentRequests()"><i class="fas fa-redo"></i> 重新加载</button></div>';
@@ -1207,7 +1430,7 @@ async function handleStatusPage(request, env) {
   });
 }
 
-// ---------- 页面处理：初始化页面（与之前相同，无语法错误）----------
+// ---------- 页面处理：初始化页面（与之前相同）----------
 async function handleInitPage(request, env) {
   const config = getConfig(env);
   const count = await env.DB.prepare('SELECT COUNT(*) as c FROM backend_servers').first();

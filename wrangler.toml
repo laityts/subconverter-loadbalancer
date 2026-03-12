@@ -12,12 +12,16 @@ database_id = "a34f0c72-013c-4875-a814-1d5ccbd6279f"
 INITIAL_WEIGHT = "10"
 MAX_WEIGHT = "20"
 MIN_WEIGHT = "1"
-REQUEST_TIMEOUT = "10000"  # 毫秒
+REQUEST_TIMEOUT = "5000"          # 毫秒
+MAX_LOG_ENTRIES = "20"             # 保留最近请求日志条数
+CIRCUIT_BREAKER_THRESHOLD = "5"    # 连续失败熔断阈值
+CIRCUIT_BREAKER_TIMEOUT = "1800"    # 熔断冷却时间（秒），默认30分钟
+HEALTH_CHECK_FAIL_THRESHOLD = "3"  # 健康检查连续失败阈值
 DEFAULT_BACKENDS = '["https://url.v1.mk","https://subapi.cmliussss.net","https://subapi.sosoorg.com","https://subapi.fxxk.dedyn.io","https://subapi.zrfme.com"]'
 
-# 定时触发器（每30分钟执行健康检查）
+# 定时触发器（每30分钟执行健康检查，每1小时清理旧日志）
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["*/30 * * * *", "0 * * * *"]
 
 [observability]
 enabled = true
