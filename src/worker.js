@@ -1373,6 +1373,34 @@ async function handleStatusPage(request, env) {
       if (debugEnabled) updateDebugPanel();
     }
 
+    // 新增：调整两个表格高度一致（仅桌面端）
+    function adjustTableHeights() {
+      // 移动端不处理
+      if (window.innerWidth <= 768) {
+        // 清除可能设置的固定高度，恢复默认
+        const recentContainer = document.querySelector('#recent-requests-container .stats-table-container');
+        if (recentContainer) {
+          recentContainer.style.height = '';
+          recentContainer.style.overflowY = '';
+        }
+        return;
+      }
+
+      const backendContainer = document.querySelector('#backend-stats-container .stats-table-container');
+      const recentContainer = document.querySelector('#recent-requests-container .stats-table-container');
+
+      if (backendContainer && recentContainer) {
+        // 获取后端表格容器的高度（包括内边距和边框）
+        const backendHeight = backendContainer.offsetHeight;
+        if (backendHeight > 0) {
+          recentContainer.style.height = backendHeight + 'px';
+          recentContainer.style.overflowY = 'auto';
+        } else {
+          // 如果高度为0（可能还在加载），暂时不设置
+        }
+      }
+    }
+
     // 数据加载
     async function loadBackendStats() {
       addDebugLog('开始加载后端统计');
@@ -1385,6 +1413,8 @@ async function handleStatusPage(request, env) {
         addDebugLog('后端统计接收', { count: data.length });
         if (!data.length) {
           container.innerHTML = '<div class="empty-state"><i class="fas fa-server"></i><h3>暂无后端服务器</h3><button class="btn btn-primary" onclick="location.href=\\'/init\\'"><i class="fas fa-cog"></i> 前往设置</button></div>';
+          // 调整高度（可能为空状态，也需要同步）
+          setTimeout(adjustTableHeights, 50);
           return;
         }
         document.getElementById('total-backends').textContent = data.length;
@@ -1460,9 +1490,12 @@ async function handleStatusPage(request, env) {
         tableHtml += '</tbody></table></div>';
         cardsHtml += '</div>';
         container.innerHTML = tableHtml + cardsHtml;
+        // 调整高度
+        setTimeout(adjustTableHeights, 50);
       } catch (e) {
         addDebugLog('加载后端统计失败', { error: e.message });
         container.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i><h3>加载失败</h3><p>'+e.message+'</p><button class="btn btn-primary" onclick="loadBackendStats()"><i class="fas fa-redo"></i> 重新加载</button></div>';
+        setTimeout(adjustTableHeights, 50);
       }
     }
 
@@ -1477,6 +1510,7 @@ async function handleStatusPage(request, env) {
         addDebugLog('最近请求接收', { count: data.length });
         if (!data.length) {
           container.innerHTML = '<div class="empty-state"><i class="fas fa-history"></i><h3>暂无请求记录</h3><p>系统尚未处理任何请求</p></div>';
+          setTimeout(adjustTableHeights, 50);
           return;
         }
         let tableHtml = '<div class="stats-table-container"><table class="stats-table"><thead><tr><th>后端地址</th><th>状态</th><th>动态权重</th><th>响应时间</th><th>请求时间</th></tr></thead><tbody>';
@@ -1517,9 +1551,12 @@ async function handleStatusPage(request, env) {
         tableHtml += '</tbody></table></div>';
         cardsHtml += '</div>';
         container.innerHTML = tableHtml + cardsHtml;
+        // 调整高度
+        setTimeout(adjustTableHeights, 50);
       } catch (e) {
         addDebugLog('加载最近请求失败', { error: e.message });
         container.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i><h3>加载失败</h3><p>'+e.message+'</p><button class="btn btn-primary" onclick="loadRecentRequests()"><i class="fas fa-redo"></i> 重新加载</button></div>';
+        setTimeout(adjustTableHeights, 50);
       }
     }
 
@@ -1537,9 +1574,17 @@ async function handleStatusPage(request, env) {
       document.getElementById('last-update-time').textContent = formatBeijingTime(new Date().toISOString());
       if (${backends.length} === 0) loadBackendStats();
       if (${requests.length} === 0) loadRecentRequests();
+      // 初始调整高度（如果已有数据）
+      setTimeout(adjustTableHeights, 100);
       setInterval(refreshData, 120000);
       document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshData(); });
     });
+
+    // 监听窗口大小变化，重新调整高度
+    window.addEventListener('resize', () => {
+      adjustTableHeights();
+    });
+
     document.addEventListener('keydown', (e) => {
       if (e.ctrlKey && e.key === 'r') { e.preventDefault(); refreshData(); addDebugLog('快捷键刷新'); }
       if (e.ctrlKey && e.key === 'd') { e.preventDefault(); toggleDebug(); }
