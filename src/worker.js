@@ -688,7 +688,6 @@ async function handleStatusPage(request, env) {
           ${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
           ${disabledUntil ? `<span class="status-badge status-failed">熔断至 ${disabledUntil}</span>` : ''}
         </div>
-        <div style="max-width:200px; overflow:hidden; text-overflow:ellipsis;">${b.url || '未知'}</div>
       </td>
       <td data-label="请求统计">
         <div><small>总请求: ${total}</small></div>
@@ -704,10 +703,12 @@ async function handleStatusPage(request, env) {
       </td>
       <td data-label="权重状态">
         <div><small>基础权重: ${b.weight || config.INITIAL_WEIGHT}</small></div>
-        <div><small>动态权重: ${dynamicWeight.toFixed(1)}</small></div>
+        <div>
+          <small>动态权重: ${dynamicWeight.toFixed(1)}</small>
+          <span class="weight-badge ${className}" style="margin-left: 8px;" title="当前权重等级">${level}</span>
+        </div>
         <div><small>最后使用: ${b.last_used ? formatBeijingTimeForHTML(b.last_used) : '从未'}</small></div>
         <div><small>最后健康检查: ${b.last_health_check ? formatBeijingTimeForHTML(b.last_health_check) : '从未'}</small></div>
-        <div><span class="weight-badge ${className}" title="当前权重等级">${level}</span></div>
       </td>
     </tr>`;
   }).join('');
@@ -720,7 +721,6 @@ async function handleStatusPage(request, env) {
     return `<tr>
       <td data-label="后端地址">
         <div class="mobile-row"><strong>${r.backend_url || '未知'}</strong></div>
-        <div style="max-width:180px; overflow:hidden; text-overflow:ellipsis;">${r.backend_url || '未知'}</div>
       </td>
       <td data-label="状态">
         <span class="status-badge ${statusClass}">${statusText}</span>
