@@ -36,14 +36,14 @@ function logError(message, error = null, reqId = null) {
 function getConfig(env) {
   return {
     INITIAL_WEIGHT: parseInt(env.INITIAL_WEIGHT) || 10,
-    MAX_WEIGHT: parseInt(env.MAX_WEIGHT) || 10,
+    MAX_WEIGHT: parseInt(env.MAX_WEIGHT) || 20,
     MIN_WEIGHT: parseInt(env.MIN_WEIGHT) || 1,
-    REQUEST_TIMEOUT: parseInt(env.REQUEST_TIMEOUT) || 5000,
-    MAX_LOG_ENTRIES: parseInt(env.MAX_LOG_ENTRIES) || 50,
+    REQUEST_TIMEOUT: parseInt(env.REQUEST_TIMEOUT) || 10000,
+    MAX_LOG_ENTRIES: parseInt(env.MAX_LOG_ENTRIES) || 20,
     CIRCUIT_BREAKER_THRESHOLD: parseInt(env.CIRCUIT_BREAKER_THRESHOLD) || 5,
-    CIRCUIT_BREAKER_TIMEOUT: parseInt(env.CIRCUIT_BREAKER_TIMEOUT) || 1800, // 秒
+    CIRCUIT_BREAKER_TIMEOUT: parseInt(env.CIRCUIT_BREAKER_TIMEOUT) || 300, // 秒
     HEALTH_CHECK_FAIL_THRESHOLD: parseInt(env.HEALTH_CHECK_FAIL_THRESHOLD) || 3,
-    HEALTH_CHECK_URL: env.HEALTH_CHECK_URL || '/sub?target=clash&url=https://misub.vlato.site/getSub/e7d16b32-87cf-4d12-9096-800d8d043bc9', // 默认健康检查URL
+    HEALTH_CHECK_URL: env.HEALTH_CHECK_URL || '/sub?target=clash&url=https://www.google.com', // 默认健康检查URL
     DEFAULT_BACKENDS: env.DEFAULT_BACKENDS ? JSON.parse(env.DEFAULT_BACKENDS) : [
       'https://url.v1.mk',
       'https://subapi.cmliussss.net',
@@ -634,7 +634,7 @@ async function handleInitDatabase(request, env) {
   }
 }
 
-// ---------- 页面处理：状态页面（移动端地址横向滚动）----------
+// ---------- 页面处理：状态页面（动态计算权重等级，不同颜色标签）----------
 async function handleStatusPage(request, env) {
   const config = getConfig(env);
   const reqId = generateRequestId();
@@ -654,6 +654,18 @@ async function handleStatusPage(request, env) {
   const backends = backendStats.value?.results || [];
   const requests = recentRequests.value?.results || [];
 
+  // 辅助函数：根据权重计算等级和CSS类
+  function getWeightInfo(weight) {
+    const min = config.MIN_WEIGHT;
+    const max = config.MAX_WEIGHT;
+    const range = max - min;
+    const lowThreshold = min + range / 3;
+    const mediumThreshold = min + 2 * range / 3;
+    if (weight < lowThreshold) return { level: '低', className: 'weight-low' };
+    if (weight < mediumThreshold) return { level: '中', className: 'weight-medium' };
+    return { level: '高', className: 'weight-high' };
+  }
+
   // 构造后端表格行
   const backendRows = backends.map(b => {
     const total = b.total_requests || 0;
@@ -666,6 +678,7 @@ async function handleStatusPage(request, env) {
     const healthy = b.healthy === 1;
     const disabledUntil = b.disabled_until ? new Date(b.disabled_until).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : null;
     const dynamicWeight = b.dynamic_weight || b.weight || config.INITIAL_WEIGHT;
+    const { level, className } = getWeightInfo(dynamicWeight);
 
     return `<tr>
       <td data-label="后端地址">
@@ -694,6 +707,7 @@ async function handleStatusPage(request, env) {
         <div><small>动态权重: ${dynamicWeight.toFixed(1)}</small></div>
         <div><small>最后使用: ${b.last_used ? formatBeijingTimeForHTML(b.last_used) : '从未'}</small></div>
         <div><small>最后健康检查: ${b.last_health_check ? formatBeijingTimeForHTML(b.last_health_check) : '从未'}</small></div>
+        <div><span class="weight-badge ${className}" title="当前权重等级">${level}</span></div>
       </td>
     </tr>`;
   }).join('');
@@ -702,7 +716,7 @@ async function handleStatusPage(request, env) {
     const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
     const statusText = r.status === 'success' ? '成功' : '失败';
     const weight = r.dynamic_weight || 0;
-    const weightLevel = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
+    const { level, className } = getWeightInfo(weight);
     return `<tr>
       <td data-label="后端地址">
         <div class="mobile-row"><strong>${r.backend_url || '未知'}</strong></div>
@@ -715,7 +729,7 @@ async function handleStatusPage(request, env) {
       <td data-label="动态权重">
         <div class="weight-info">
           <span class="weight-badge" title="请求时的动态权重">${weight.toFixed(1)}</span>
-          <div class="weight-label">${weightLevel}权重</div>
+          <span class="weight-badge ${className}" style="margin-left:4px;" title="权重等级">${level}</span>
         </div>
       </td>
       <td data-label="响应时间">${formatResponseTimeForHTML(r.response_time || 0)}</td>
@@ -735,6 +749,7 @@ async function handleStatusPage(request, env) {
     const healthy = b.healthy === 1;
     const disabledUntil = b.disabled_until ? new Date(b.disabled_until).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : null;
     const dynamicWeight = b.dynamic_weight || b.weight || config.INITIAL_WEIGHT;
+    const { level, className } = getWeightInfo(dynamicWeight);
 
     return `<div class="mobile-card">
       <div class="mobile-card-header">
@@ -747,6 +762,7 @@ async function handleStatusPage(request, env) {
         <div><span>成功率:</span> ${rate}% <span class="progress-container" style="width:60px; display:inline-block; margin-left:8px;"><div class="progress-bar" style="width:${Math.min(rate,100)}%"></div></span></div>
         <div><span>平均响应:</span> ${formatResponseTimeForHTML(avgRT)}</div>
         <div><span>动态权重:</span> ${dynamicWeight.toFixed(1)} (基础: ${b.weight || config.INITIAL_WEIGHT})</div>
+        <div><span>权重等级:</span> <span class="weight-badge ${className}">${level}</span></div>
         <div><span>EWMA成功率:</span> ${ewma}</div>
         <div><span>连续失败:</span> ${consecFails}</div>
         <div><span>最后使用:</span> ${b.last_used ? formatBeijingTimeForHTML(b.last_used) : '从未'}</div>
@@ -760,14 +776,15 @@ async function handleStatusPage(request, env) {
     const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
     const statusText = r.status === 'success' ? '成功' : '失败';
     const weight = r.dynamic_weight || 0;
-    const weightLevel = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
+    const { level, className } = getWeightInfo(weight);
     return `<div class="mobile-card">
       <div class="mobile-card-header">
         <strong class="mobile-card-address" title="${r.backend_url || '未知'}">${r.backend_url || '未知'}</strong>
         <span class="status-badge ${statusClass}">${statusText}</span>
       </div>
       <div class="mobile-card-body">
-        <div><span>动态权重:</span> ${weight.toFixed(1)} (${weightLevel})</div>
+        <div><span>动态权重:</span> ${weight.toFixed(1)}</div>
+        <div><span>权重等级:</span> <span class="weight-badge ${className}">${level}</span></div>
         <div><span>响应时间:</span> ${formatResponseTimeForHTML(r.response_time || 0)}</div>
         <div><span>请求时间:</span> ${formatBeijingTimeForHTML(r.request_time || new Date().toISOString())}</div>
         ${r.error_message ? `<div><span>错误:</span> ${r.error_message.substring(0,40)}${r.error_message.length>40?'...':''}</div>` : ''}
@@ -797,7 +814,9 @@ async function handleStatusPage(request, env) {
       --shadow-lg: 0 10px 25px rgba(0,0,0,0.1);
       --radius-md: 12px;
       --radius-lg: 16px;
-      --weight-gradient: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+      --weight-low: #a0aec0;      /* 灰色 */
+      --weight-medium: #4299e1;    /* 蓝色 */
+      --weight-high: #48bb78;      /* 绿色 */
       --healthy-badge-bg: #c6f6d5;
       --healthy-badge-text: #22543d;
       --unhealthy-badge-bg: #fed7d7;
@@ -1049,28 +1068,28 @@ async function handleStatusPage(request, env) {
     }
     .weight-badge {
       display: inline-block;
-      padding: 6px 12px;
-      background: var(--weight-gradient);
-      color: #22543d;
-      border-radius: 20px;
-      font-size: 13px;
-      font-weight: 700;
+      padding: 4px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
       text-align: center;
-      min-width: 60px;
-      box-shadow: 0 2px 4px rgba(67,233,123,0.3);
-      transition: transform 0.2s ease;
+      min-width: 40px;
+      color: white;
     }
-    .weight-badge:hover { transform: scale(1.05); }
+    .weight-low {
+      background-color: var(--weight-low);
+    }
+    .weight-medium {
+      background-color: var(--weight-medium);
+    }
+    .weight-high {
+      background-color: var(--weight-high);
+    }
     .weight-info {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 6px;
       flex-wrap: wrap;
-    }
-    .weight-label {
-      font-size: 12px;
-      color: var(--text-secondary);
-      white-space: nowrap;
     }
     .progress-container {
       background: #e2e8f0;
@@ -1157,10 +1176,14 @@ async function handleStatusPage(request, env) {
       .stats-table tbody tr:hover { background: #4a5568; }
       .mobile-card { background: #2d3748; }
       .progress-container { background: #4a5568; }
-      .weight-badge {
-        background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
-        color: #81e6d9;
-        border: 1px solid #38a169;
+      .weight-low {
+        background-color: #4a5568;
+      }
+      .weight-medium {
+        background-color: #3182ce;
+      }
+      .weight-high {
+        background-color: #38a169;
       }
     }
   </style>
@@ -1304,6 +1327,19 @@ async function handleStatusPage(request, env) {
       return ms < 1000 ? ms.toFixed(0) + 'ms' : (ms/1000).toFixed(2) + 's';
     }
 
+    // 权重等级计算（与后端一致）
+    const MIN_WEIGHT = ${config.MIN_WEIGHT};
+    const MAX_WEIGHT = ${config.MAX_WEIGHT};
+    const RANGE = MAX_WEIGHT - MIN_WEIGHT;
+    const LOW_THRESHOLD = MIN_WEIGHT + RANGE / 3;
+    const MEDIUM_THRESHOLD = MIN_WEIGHT + 2 * RANGE / 3;
+
+    function getWeightInfo(weight) {
+      if (weight < LOW_THRESHOLD) return { level: '低', className: 'weight-low' };
+      if (weight < MEDIUM_THRESHOLD) return { level: '中', className: 'weight-medium' };
+      return { level: '高', className: 'weight-high' };
+    }
+
     // 调试系统
     let debugEnabled = localStorage.getItem('debugEnabled') === 'true';
     let debugLogs = JSON.parse(localStorage.getItem('debugLogs') || '[]');
@@ -1362,6 +1398,7 @@ async function handleStatusPage(request, env) {
           const healthy = b.healthy === 1;
           const disabledUntil = b.disabled_until ? formatBeijingTime(b.disabled_until) : null;
           const dynamicWeight = b.dynamic_weight || b.weight || ${config.INITIAL_WEIGHT};
+          const { level, className } = getWeightInfo(dynamicWeight);
 
           // 表格行
           tableHtml += \`<tr>
@@ -1391,6 +1428,7 @@ async function handleStatusPage(request, env) {
               <div><small>动态权重: \${dynamicWeight.toFixed(1)}</small></div>
               <div><small>最后使用: \${b.last_used ? formatBeijingTime(b.last_used) : '从未'}</small></div>
               <div><small>最后健康检查: \${b.last_health_check ? formatBeijingTime(b.last_health_check) : '从未'}</small></div>
+              <div><span class="weight-badge \${className}" title="当前权重等级">\${level}</span></div>
             </td>
           </tr>\`;
 
@@ -1406,6 +1444,7 @@ async function handleStatusPage(request, env) {
               <div><span>成功率:</span> \${rate}% <span class="progress-container" style="width:60px; display:inline-block; margin-left:8px;"><div class="progress-bar" style="width:\${Math.min(rate,100)}%"></div></span></div>
               <div><span>平均响应:</span> \${formatResponseTime(avgRT)}</div>
               <div><span>动态权重:</span> \${dynamicWeight.toFixed(1)} (基础: \${b.weight || ${config.INITIAL_WEIGHT}})</div>
+              <div><span>权重等级:</span> <span class="weight-badge \${className}">\${level}</span></div>
               <div><span>EWMA成功率:</span> \${ewma}</div>
               <div><span>连续失败:</span> \${consec}</div>
               <div><span>最后使用:</span> \${b.last_used ? formatBeijingTime(b.last_used) : '从未'}</div>
@@ -1442,12 +1481,17 @@ async function handleStatusPage(request, env) {
           const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
           const statusText = r.status === 'success' ? '成功' : '失败';
           const weight = r.dynamic_weight || 0;
-          const level = weight >= 15 ? '高' : weight >= 10 ? '中' : '低';
+          const { level, className } = getWeightInfo(weight);
 
           tableHtml += \`<tr>
             <td data-label="后端地址"><div class="mobile-row"><strong>\${r.backend_url || '未知'}</strong></div><div style="max-width:180px;overflow:hidden;text-overflow:ellipsis;">\${r.backend_url || '未知'}</div></td>
             <td data-label="状态"><span class="status-badge \${statusClass}">\${statusText}</span>\${r.error_message ? '<div><small style="color:#718096;font-size:11px;">'+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</small></div>' : ''}</td>
-            <td data-label="动态权重"><div class="weight-info"><span class="weight-badge">\${weight.toFixed(1)}</span><div class="weight-label">\${level}权重</div></div></td>
+            <td data-label="动态权重">
+              <div class="weight-info">
+                <span class="weight-badge" title="请求时的动态权重">\${weight.toFixed(1)}</span>
+                <span class="weight-badge \${className}" style="margin-left:4px;" title="权重等级">\${level}</span>
+              </div>
+            </td>
             <td data-label="响应时间">\${formatResponseTime(r.response_time || 0)}</td>
             <td data-label="请求时间">\${formatBeijingTime(r.request_time || new Date().toISOString())}</td>
           </tr>\`;
@@ -1458,7 +1502,8 @@ async function handleStatusPage(request, env) {
               <span class="status-badge \${statusClass}">\${statusText}</span>
             </div>
             <div class="mobile-card-body">
-              <div><span>动态权重:</span> \${weight.toFixed(1)} (\${level})</div>
+              <div><span>动态权重:</span> \${weight.toFixed(1)}</div>
+              <div><span>权重等级:</span> <span class="weight-badge \${className}">\${level}</span></div>
               <div><span>响应时间:</span> \${formatResponseTime(r.response_time || 0)}</div>
               <div><span>请求时间:</span> \${formatBeijingTime(r.request_time || new Date().toISOString())}</div>
               \${r.error_message ? '<div><span>错误:</span> '+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</div>' : ''}
