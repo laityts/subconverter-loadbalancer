@@ -1075,6 +1075,10 @@ async function handleStatusPage(request, env) {
       text-align: center;
       min-width: 40px;
       color: white;
+      line-height: 16px;      /* 固定行高，与字体大小+内边距匹配 */
+      height: 24px;           /* 固定高度 = line-height + 上下内边距 (16+8) */
+      white-space: nowrap;    /* 禁止换行 */
+      box-sizing: border-box; /* 确保 height 包含 padding 和 border */
     }
     .weight-low {
       background-color: var(--weight-low);
