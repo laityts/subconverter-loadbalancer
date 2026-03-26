@@ -180,22 +180,35 @@ async function triggerPassiveHealthCheck(env, backendId, backendUrl, testUrl, co
     const ok = res.ok;
     const responseTime = Date.now() - start;
     
-    await env.DB.prepare(`
-      UPDATE backend_servers 
-      SET healthy = ?, last_health_check = datetime('now'),
-          health_check_failures = ?
-      WHERE id = ?
-    `).bind(ok ? 1 : 0, ok ? 0 : 1, backendId).run();
-    
-    logInfo(`被动健康检查完成: ${backendUrl} ${ok ? '通过' : '失败'}`, { responseTime, testUrl }, reqId);
+    if (ok) {
+      await env.DB.prepare(`
+        UPDATE backend_servers 
+        SET healthy = 1, last_health_check = datetime('now'),
+            health_check_failures = 0,
+            disabled_until = NULL,
+            consecutive_failures = 0
+        WHERE id = ?
+      `).bind(backendId).run();
+      logInfo(`被动健康检查通过，已清除熔断标记: ${backendUrl}`, { responseTime, testUrl }, reqId);
+    } else {
+      await env.DB.prepare(`
+        UPDATE backend_servers 
+        SET healthy = CASE WHEN health_check_failures + 1 >= ? THEN 0 ELSE 1 END,
+            last_health_check = datetime('now'),
+            health_check_failures = health_check_failures + 1
+        WHERE id = ?
+      `).bind(config.HEALTH_CHECK_FAIL_THRESHOLD, backendId).run();
+      logInfo(`被动健康检查失败: ${backendUrl}`, { responseTime, testUrl }, reqId);
+    }
   } catch (error) {
     logError(`被动健康检查失败: ${backendUrl}`, error, reqId);
     await env.DB.prepare(`
       UPDATE backend_servers 
-      SET healthy = 0, last_health_check = datetime('now'),
+      SET healthy = CASE WHEN health_check_failures + 1 >= ? THEN 0 ELSE 1 END,
+          last_health_check = datetime('now'),
           health_check_failures = health_check_failures + 1
       WHERE id = ?
-    `).bind(backendId).run();
+    `).bind(config.HEALTH_CHECK_FAIL_THRESHOLD, backendId).run();
   }
 }
 
@@ -234,21 +247,35 @@ async function updateBackendStats(env, backendId, backendUrl, success, responseT
     const baseWeight = record.weight || config.INITIAL_WEIGHT;
     const dynamicWeight = computeDynamicWeight(baseWeight, ewma, avgRT, consecutiveFails, config);
 
-    await env.DB.prepare(`
-      UPDATE backend_servers 
-      SET total_requests = ?, success_count = ?, fail_count = ?,
-          average_response_time = ?, last_response_time = ?,
-          ewma_success_rate = ?, consecutive_failures = ?,
-          dynamic_weight = ?, last_used = datetime('now'),
-          disabled_until = ?
-      WHERE id = ?
-    `).bind(total, successCount, failCount, avgRT, responseTime,
-            ewma, consecutiveFails, dynamicWeight, disabledUntil, backendId).run();
+    if (success) {
+      await env.DB.prepare(`
+        UPDATE backend_servers 
+        SET total_requests = ?, success_count = ?, fail_count = ?,
+            average_response_time = ?, last_response_time = ?,
+            ewma_success_rate = ?, consecutive_failures = ?,
+            dynamic_weight = ?, last_used = datetime('now'),
+            disabled_until = NULL,
+            healthy = 1,
+            health_check_failures = 0
+        WHERE id = ?
+      `).bind(total, successCount, failCount, avgRT, responseTime,
+              ewma, consecutiveFails, dynamicWeight, backendId).run();
+    } else {
+      await env.DB.prepare(`
+        UPDATE backend_servers 
+        SET total_requests = ?, success_count = ?, fail_count = ?,
+            average_response_time = ?, last_response_time = ?,
+            ewma_success_rate = ?, consecutive_failures = ?,
+            dynamic_weight = ?, last_used = datetime('now'),
+            disabled_until = ?
+        WHERE id = ?
+      `).bind(total, successCount, failCount, avgRT, responseTime,
+              ewma, consecutiveFails, dynamicWeight, disabledUntil, backendId).run();
+    }
 
     const dbTime = Date.now() - startTime;
     logDebug(`后端统计更新完成`, { backendId, dbTime, dynamicWeight }, reqId);
 
-    // 被动健康检查：如果连续失败达到阈值（如3次），触发主动探测，使用传入的testUrl
     if (!success && consecutiveFails >= 3 && testUrl) {
       triggerPassiveHealthCheck(env, backendId, backendUrl, testUrl, config, reqId).catch(e => 
         logError('被动健康检查执行失败', e, reqId)
@@ -392,7 +419,6 @@ async function handleSubscriptionRequest(request, env, ctx) {
       status = isSuccess ? 'success' : 'failed';
       errorMsg = isSuccess ? '' : `HTTP ${statusCode}`;
 
-      // 异步记录日志和统计，传入当前请求的路径用于被动健康检查
       ctx.waitUntil((async () => {
         await Promise.all([
           logRequest(env, {
@@ -518,28 +544,34 @@ async function scheduledHealthCheck(env, config, ctx) {
     const backends = await env.DB.prepare(`SELECT id, url, health_check_failures FROM backend_servers WHERE enabled = 1`).all();
     if (!backends.results) return;
 
-    const testUrl = config.HEALTH_CHECK_URL; // 从环境变量读取
+    const testUrl = config.HEALTH_CHECK_URL;
     for (const backend of backends.results) {
       try {
         const start = Date.now();
         const res = await fetchWithTimeout(`${backend.url}${testUrl}`, {}, config.REQUEST_TIMEOUT);
         const ok = res.ok;
         const responseTime = Date.now() - start;
-        let healthFailures = backend.health_check_failures || 0;
-        if (!ok) {
-          healthFailures += 1;
+        if (ok) {
+          await env.DB.prepare(`
+            UPDATE backend_servers 
+            SET healthy = 1, last_health_check = datetime('now'),
+                health_check_failures = 0,
+                disabled_until = NULL,
+                consecutive_failures = 0
+            WHERE id = ?
+          `).bind(backend.id).run();
+          logDebug(`健康检查通过，已清除熔断标记: ${backend.url}`, { responseTime, testUrl }, reqId);
         } else {
-          healthFailures = 0;
+          let healthFailures = (backend.health_check_failures || 0) + 1;
+          const healthy = healthFailures < config.HEALTH_CHECK_FAIL_THRESHOLD;
+          await env.DB.prepare(`
+            UPDATE backend_servers 
+            SET healthy = ?, last_health_check = datetime('now'),
+                health_check_failures = ?
+            WHERE id = ?
+          `).bind(healthy ? 1 : 0, healthFailures, backend.id).run();
+          logDebug(`健康检查失败: ${backend.url} (连续失败 ${healthFailures})`, { responseTime, testUrl }, reqId);
         }
-        const healthy = healthFailures < config.HEALTH_CHECK_FAIL_THRESHOLD;
-        await env.DB.prepare(`
-          UPDATE backend_servers 
-          SET healthy = ?, last_health_check = datetime('now'),
-              health_check_failures = ?
-          WHERE id = ?
-        `).bind(healthy ? 1 : 0, healthFailures, backend.id).run();
-        logDebug(`健康检查 ${backend.url}: ${ok ? '通过' : '失败'} (连续失败 ${healthFailures})`, 
-          { responseTime, testUrl }, reqId);
       } catch (e) {
         let healthFailures = (backend.health_check_failures || 0) + 1;
         const healthy = healthFailures < config.HEALTH_CHECK_FAIL_THRESHOLD;
@@ -572,13 +604,21 @@ async function scheduled(event, env, ctx) {
 async function handleBackendStats(request, env) {
   const reqId = generateRequestId();
   try {
-    const result = await env.DB.prepare(`
+    let results = await env.DB.prepare(`
       SELECT id, url, weight, dynamic_weight, total_requests, success_count, fail_count,
              average_response_time, last_response_time, ewma_success_rate, consecutive_failures,
              health_check_failures, disabled_until, last_used, enabled, healthy, last_health_check, created_at
       FROM backend_servers ORDER BY dynamic_weight DESC
     `).all();
-    return new Response(JSON.stringify(result.results || []), {
+    let backends = results.results || [];
+    const now = new Date();
+    backends = backends.map(b => {
+      if (b.disabled_until && new Date(b.disabled_until) < now) {
+        b.disabled_until = null;
+      }
+      return b;
+    });
+    return new Response(JSON.stringify(backends), {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }
     });
   } catch (error) {
@@ -634,7 +674,31 @@ async function handleInitDatabase(request, env) {
   }
 }
 
-// ---------- 页面处理：状态页面（动态计算权重等级，不同颜色标签）----------
+// ---------- 辅助格式化函数 ----------
+function formatResponseTimeForHTML(ms) {
+  if (!ms || ms < 0) return '0ms';
+  return ms < 1000 ? ms.toFixed(0) + 'ms' : (ms / 1000).toFixed(2) + 's';
+}
+
+function formatBeijingTimeForHTML(isoString) {
+  if (!isoString) return '从未';
+  try {
+    return new Date(isoString).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch {
+    return isoString;
+  }
+}
+
+function escapeHtmlAttr(str) {
+  if (!str) return '';
+  return str.replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+}
+
+// ---------- 页面处理：状态页面 ----------
 async function handleStatusPage(request, env) {
   const config = getConfig(env);
   const reqId = generateRequestId();
@@ -651,10 +715,16 @@ async function handleStatusPage(request, env) {
     `).all()
   ]);
 
-  const backends = backendStats.value?.results || [];
+  let backends = backendStats.value?.results || [];
   const requests = recentRequests.value?.results || [];
+  const now = new Date();
+  backends = backends.map(b => {
+    if (b.disabled_until && new Date(b.disabled_until) < now) {
+      b.disabled_until = null;
+    }
+    return b;
+  });
 
-  // 辅助函数：根据权重计算等级和CSS类
   function getWeightInfo(weight) {
     const min = config.MIN_WEIGHT;
     const max = config.MAX_WEIGHT;
@@ -666,7 +736,6 @@ async function handleStatusPage(request, env) {
     return { level: '高', className: 'weight-high' };
   }
 
-  // 构造后端表格行
   const backendRows = backends.map(b => {
     const total = b.total_requests || 0;
     const success = b.success_count || 0;
@@ -676,17 +745,22 @@ async function handleStatusPage(request, env) {
     const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
     const consecFails = b.consecutive_failures || 0;
     const healthy = b.healthy === 1;
-    const disabledUntil = b.disabled_until ? new Date(b.disabled_until).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : null;
+    const isCircuitOpen = b.disabled_until && new Date(b.disabled_until) > now;
     const dynamicWeight = b.dynamic_weight || b.weight || config.INITIAL_WEIGHT;
     const { level, className } = getWeightInfo(dynamicWeight);
 
+    let circuitStatusHtml = '';
+    if (isCircuitOpen) {
+      circuitStatusHtml = `<span class="status-badge status-failed" style="background:#e53e3e; color:white;">熔断中</span>`;
+    }
+
     return `<tr>
       <td data-label="后端地址">
-        <div class="mobile-row"><strong>${b.url || '未知'}</strong></div>
+        <div class="mobile-row"><strong>${escapeHtmlAttr(b.url || '未知')}</strong></div>
         <div style="display:flex; flex-wrap:wrap; gap:6px;">
           <span class="healthy-badge ${healthy ? 'healthy-true' : 'healthy-false'}">${healthy ? '健康' : '不健康'}</span>
+          ${circuitStatusHtml}
           ${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
-          ${disabledUntil ? `<span class="status-badge status-failed">熔断至 ${disabledUntil}</span>` : ''}
         </div>
       </td>
       <td data-label="请求统计">
@@ -713,6 +787,45 @@ async function handleStatusPage(request, env) {
     </tr>`;
   }).join('');
 
+  const backendCards = backends.map(b => {
+    const total = b.total_requests || 0;
+    const success = b.success_count || 0;
+    const fail = b.fail_count || 0;
+    const rate = total > 0 ? ((success / total) * 100).toFixed(1) : '0.0';
+    const avgRT = b.average_response_time || 0;
+    const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
+    const consecFails = b.consecutive_failures || 0;
+    const healthy = b.healthy === 1;
+    const isCircuitOpen = b.disabled_until && new Date(b.disabled_until) > now;
+    const dynamicWeight = b.dynamic_weight || b.weight || config.INITIAL_WEIGHT;
+    const { level, className } = getWeightInfo(dynamicWeight);
+
+    let circuitStatusHtml = '';
+    if (isCircuitOpen) {
+      circuitStatusHtml = `<span class="status-badge status-failed" style="background:#e53e3e; color:white;">熔断中</span>`;
+    }
+
+    return `<div class="mobile-card">
+      <div class="mobile-card-header">
+        <strong class="mobile-card-address" title="${escapeHtmlAttr(b.url || '未知')}">${escapeHtmlAttr(b.url || '未知')}</strong>
+        <span class="healthy-badge ${healthy ? 'healthy-true' : 'healthy-false'}">${healthy ? '健康' : '不健康'}</span>
+        ${circuitStatusHtml}
+      </div>
+      <div class="mobile-card-body">
+        <div><span>总请求:</span> ${total}</div>
+        <div><span>成功/失败:</span> ${success}/${fail}</div>
+        <div><span>成功率:</span> ${rate}% <span class="progress-container" style="width:60px; display:inline-block; margin-left:8px;"><div class="progress-bar" style="width:${Math.min(rate,100)}%"></div></span></div>
+        <div><span>平均响应:</span> ${formatResponseTimeForHTML(avgRT)}</div>
+        <div><span>动态权重:</span> ${dynamicWeight.toFixed(1)} (基础: ${b.weight || config.INITIAL_WEIGHT})</div>
+        <div><span>权重等级:</span> <span class="weight-badge ${className}">${level}</span></div>
+        <div><span>EWMA成功率:</span> ${ewma}</div>
+        <div><span>连续失败:</span> ${consecFails}</div>
+        <div><span>最后使用:</span> ${b.last_used ? formatBeijingTimeForHTML(b.last_used) : '从未'}</div>
+        <div><span>健康检查:</span> ${b.last_health_check ? formatBeijingTimeForHTML(b.last_health_check) : '从未'}</div>
+      </div>
+    </div>`;
+  }).join('');
+
   const requestRows = requests.map(r => {
     const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
     const statusText = r.status === 'success' ? '成功' : '失败';
@@ -720,11 +833,11 @@ async function handleStatusPage(request, env) {
     const { level, className } = getWeightInfo(weight);
     return `<tr>
       <td data-label="后端地址">
-        <div class="mobile-row"><strong>${r.backend_url || '未知'}</strong></div>
+        <div class="mobile-row"><strong>${escapeHtmlAttr(r.backend_url || '未知')}</strong></div>
       </td>
       <td data-label="状态">
         <span class="status-badge ${statusClass}">${statusText}</span>
-        ${r.error_message ? `<div><small style="color:#718096;font-size:11px;">${r.error_message.substring(0,40)}${r.error_message.length>40?'...':''}</small></div>` : ''}
+        ${r.error_message ? `<div><small style="color:#718096;font-size:11px;">${escapeHtmlAttr(r.error_message.substring(0,40))}${r.error_message.length>40?'...':''}</small></div>` : ''}
       </td>
       <td data-label="动态权重">
         <div class="weight-info">
@@ -737,41 +850,6 @@ async function handleStatusPage(request, env) {
     </tr>`;
   }).join('');
 
-  // 移动端卡片 HTML（地址横向滚动）
-  const backendCards = backends.map(b => {
-    const total = b.total_requests || 0;
-    const success = b.success_count || 0;
-    const fail = b.fail_count || 0;
-    const rate = total > 0 ? ((success / total) * 100).toFixed(1) : '0.0';
-    const avgRT = b.average_response_time || 0;
-    const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
-    const consecFails = b.consecutive_failures || 0;
-    const healthy = b.healthy === 1;
-    const disabledUntil = b.disabled_until ? new Date(b.disabled_until).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : null;
-    const dynamicWeight = b.dynamic_weight || b.weight || config.INITIAL_WEIGHT;
-    const { level, className } = getWeightInfo(dynamicWeight);
-
-    return `<div class="mobile-card">
-      <div class="mobile-card-header">
-        <strong class="mobile-card-address" title="${b.url || '未知'}">${b.url || '未知'}</strong>
-        <span class="healthy-badge ${healthy ? 'healthy-true' : 'healthy-false'}">${healthy ? '健康' : '不健康'}</span>
-      </div>
-      <div class="mobile-card-body">
-        <div><span>总请求:</span> ${total}</div>
-        <div><span>成功/失败:</span> ${success}/${fail}</div>
-        <div><span>成功率:</span> ${rate}% <span class="progress-container" style="width:60px; display:inline-block; margin-left:8px;"><div class="progress-bar" style="width:${Math.min(rate,100)}%"></div></span></div>
-        <div><span>平均响应:</span> ${formatResponseTimeForHTML(avgRT)}</div>
-        <div><span>动态权重:</span> ${dynamicWeight.toFixed(1)} (基础: ${b.weight || config.INITIAL_WEIGHT})</div>
-        <div><span>权重等级:</span> <span class="weight-badge ${className}">${level}</span></div>
-        <div><span>EWMA成功率:</span> ${ewma}</div>
-        <div><span>连续失败:</span> ${consecFails}</div>
-        <div><span>最后使用:</span> ${b.last_used ? formatBeijingTimeForHTML(b.last_used) : '从未'}</div>
-        ${disabledUntil ? `<div><span>熔断至:</span> ${disabledUntil}</div>` : ''}
-        <div><span>健康检查:</span> ${b.last_health_check ? formatBeijingTimeForHTML(b.last_health_check) : '从未'}</div>
-      </div>
-    </div>`;
-  }).join('');
-
   const requestCards = requests.map(r => {
     const statusClass = r.status === 'success' ? 'status-success' : 'status-failed';
     const statusText = r.status === 'success' ? '成功' : '失败';
@@ -779,7 +857,7 @@ async function handleStatusPage(request, env) {
     const { level, className } = getWeightInfo(weight);
     return `<div class="mobile-card">
       <div class="mobile-card-header">
-        <strong class="mobile-card-address" title="${r.backend_url || '未知'}">${r.backend_url || '未知'}</strong>
+        <strong class="mobile-card-address" title="${escapeHtmlAttr(r.backend_url || '未知')}">${escapeHtmlAttr(r.backend_url || '未知')}</strong>
         <span class="status-badge ${statusClass}">${statusText}</span>
       </div>
       <div class="mobile-card-body">
@@ -787,7 +865,7 @@ async function handleStatusPage(request, env) {
         <div><span>权重等级:</span> <span class="weight-badge ${className}">${level}</span></div>
         <div><span>响应时间:</span> ${formatResponseTimeForHTML(r.response_time || 0)}</div>
         <div><span>请求时间:</span> ${formatBeijingTimeForHTML(r.request_time || new Date().toISOString())}</div>
-        ${r.error_message ? `<div><span>错误:</span> ${r.error_message.substring(0,40)}${r.error_message.length>40?'...':''}</div>` : ''}
+        ${r.error_message ? `<div><span>错误:</span> ${escapeHtmlAttr(r.error_message.substring(0,40))}${r.error_message.length>40?'...':''}</div>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -814,9 +892,9 @@ async function handleStatusPage(request, env) {
       --shadow-lg: 0 10px 25px rgba(0,0,0,0.1);
       --radius-md: 12px;
       --radius-lg: 16px;
-      --weight-low: #a0aec0;      /* 灰色 */
-      --weight-medium: #4299e1;    /* 蓝色 */
-      --weight-high: #48bb78;      /* 绿色 */
+      --weight-low: #a0aec0;
+      --weight-medium: #4299e1;
+      --weight-high: #48bb78;
       --healthy-badge-bg: #c6f6d5;
       --healthy-badge-text: #22543d;
       --unhealthy-badge-bg: #fed7d7;
@@ -951,7 +1029,6 @@ async function handleStatusPage(request, env) {
       background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
       color: white;
     }
-    /* 桌面端表格样式 */
     .stats-table-container {
       overflow-x: auto;
       border-radius: 10px;
@@ -987,7 +1064,6 @@ async function handleStatusPage(request, env) {
       padding: 18px 20px;
       color: var(--text-primary);
     }
-    /* 移动端卡片样式 */
     .mobile-cards {
       display: none;
       flex-direction: column;
@@ -1075,10 +1151,10 @@ async function handleStatusPage(request, env) {
       text-align: center;
       min-width: 40px;
       color: white;
-      line-height: 16px;      /* 固定行高，与字体大小+内边距匹配 */
-      height: 24px;           /* 固定高度 = line-height + 上下内边距 (16+8) */
-      white-space: nowrap;    /* 禁止换行 */
-      box-sizing: border-box; /* 确保 height 包含 padding 和 border */
+      line-height: 16px;
+      height: 24px;
+      white-space: nowrap;
+      box-sizing: border-box;
     }
     .weight-low {
       background-color: var(--weight-low);
@@ -1216,7 +1292,6 @@ async function handleStatusPage(request, env) {
     </div>
 
     <div class="stats-grid">
-      <!-- 后端服务器状态卡片 -->
       <div class="card fade-in" style="animation-delay:0.1s;">
         <div class="card-header">
           <h2><span class="icon server-icon"><i class="fas fa-server"></i></span> 后端服务器状态</h2>
@@ -1224,23 +1299,14 @@ async function handleStatusPage(request, env) {
         </div>
         <div id="backend-stats-container">
           ${backends.length > 0 ? `
-            <!-- 桌面端表格 -->
             <div class="stats-table-container">
               <table class="stats-table">
-                <thead>
-                  <tr>
-                    <th>后端地址 / 健康</th>
-                    <th>请求统计</th>
-                    <th>性能指标</th>
-                    <th>权重状态</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>后端地址 / 健康</th><th>请求统计</th><th>性能指标</th><th>权重状态</th></tr></thead>
                 <tbody id="backend-stats-body">
                   ${backendRows}
                 </tbody>
               </table>
             </div>
-            <!-- 移动端卡片 -->
             <div class="mobile-cards" id="backend-mobile-cards">
               ${backendCards}
             </div>
@@ -1253,7 +1319,6 @@ async function handleStatusPage(request, env) {
         </div>
       </div>
 
-      <!-- 最近请求记录卡片 -->
       <div class="card fade-in" style="animation-delay:0.2s;">
         <div class="card-header">
           <h2><span class="icon history-icon"><i class="fas fa-history"></i></span> 最近请求记录</h2>
@@ -1261,27 +1326,13 @@ async function handleStatusPage(request, env) {
         </div>
         <div id="recent-requests-container">
           ${requests.length > 0 ? `
-            <!-- 桌面端表格 -->
             <div class="stats-table-container">
               <table class="stats-table">
-                <thead>
-                  <tr>
-                    <th>后端地址</th>
-                    <th>状态</th>
-                    <th>动态权重</th>
-                    <th>响应时间</th>
-                    <th>请求时间</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${requestRows}
-                </tbody>
+                <thead><tr><th>后端地址</th><th>状态</th><th>动态权重</th><th>响应时间</th><th>请求时间</th></tr></thead>
+                <tbody>${requestRows}</tbody>
               </table>
             </div>
-            <!-- 移动端卡片 -->
-            <div class="mobile-cards" id="recent-mobile-cards">
-              ${requestCards}
-            </div>
+            <div class="mobile-cards" id="recent-mobile-cards">${requestCards}</div>
           ` : `
             <div class="loading-state" id="recent-requests-loading">
               <div class="loading-spinner"></div>
@@ -1292,7 +1343,6 @@ async function handleStatusPage(request, env) {
       </div>
     </div>
 
-    <!-- 系统信息卡片 -->
     <div class="card fade-in" style="animation-delay:0.3s; margin-top:25px;">
       <div class="card-header">
         <h2><span class="icon" style="background:linear-gradient(135deg,#f093fb 0%,#f5576c 100%); color:white;"><i class="fas fa-info-circle"></i></span> 系统信息</h2>
@@ -1331,7 +1381,6 @@ async function handleStatusPage(request, env) {
       return ms < 1000 ? ms.toFixed(0) + 'ms' : (ms/1000).toFixed(2) + 's';
     }
 
-    // 权重等级计算（与后端一致）
     const MIN_WEIGHT = ${config.MIN_WEIGHT};
     const MAX_WEIGHT = ${config.MAX_WEIGHT};
     const RANGE = MAX_WEIGHT - MIN_WEIGHT;
@@ -1344,7 +1393,26 @@ async function handleStatusPage(request, env) {
       return { level: '高', className: 'weight-high' };
     }
 
-    // 调试系统
+    // 熔断倒计时更新
+    function updateCircuitCountdowns() {
+      const now = new Date();
+      document.querySelectorAll('[data-circuit-end]').forEach(el => {
+        const endTime = new Date(el.getAttribute('data-circuit-end'));
+        if (endTime > now) {
+          const diffSeconds = Math.floor((endTime - now) / 1000);
+          const minutes = Math.floor(diffSeconds / 60);
+          const seconds = diffSeconds % 60;
+          const text = minutes > 0 ? \`熔断中 (\${minutes}分\${seconds}秒)\` : \`熔断中 (\${seconds}秒)\`;
+          el.innerText = text;
+        } else {
+          // 过期后隐藏或刷新页面
+          el.style.display = 'none';
+          // 可选：触发数据刷新
+          refreshData();
+        }
+      });
+    }
+
     let debugEnabled = localStorage.getItem('debugEnabled') === 'true';
     let debugLogs = JSON.parse(localStorage.getItem('debugLogs') || '[]');
     function addDebugLog(message, data = null) {
@@ -1373,11 +1441,8 @@ async function handleStatusPage(request, env) {
       if (debugEnabled) updateDebugPanel();
     }
 
-    // 新增：调整两个表格高度一致（仅桌面端）
     function adjustTableHeights() {
-      // 移动端不处理
       if (window.innerWidth <= 768) {
-        // 清除可能设置的固定高度，恢复默认
         const recentContainer = document.querySelector('#recent-requests-container .stats-table-container');
         if (recentContainer) {
           recentContainer.style.height = '';
@@ -1385,23 +1450,17 @@ async function handleStatusPage(request, env) {
         }
         return;
       }
-
       const backendContainer = document.querySelector('#backend-stats-container .stats-table-container');
       const recentContainer = document.querySelector('#recent-requests-container .stats-table-container');
-
       if (backendContainer && recentContainer) {
-        // 获取后端表格容器的高度（包括内边距和边框）
         const backendHeight = backendContainer.offsetHeight;
         if (backendHeight > 0) {
           recentContainer.style.height = backendHeight + 'px';
           recentContainer.style.overflowY = 'auto';
-        } else {
-          // 如果高度为0（可能还在加载），暂时不设置
         }
       }
     }
 
-    // 数据加载
     async function loadBackendStats() {
       addDebugLog('开始加载后端统计');
       const container = document.getElementById('backend-stats-container');
@@ -1413,12 +1472,10 @@ async function handleStatusPage(request, env) {
         addDebugLog('后端统计接收', { count: data.length });
         if (!data.length) {
           container.innerHTML = '<div class="empty-state"><i class="fas fa-server"></i><h3>暂无后端服务器</h3><button class="btn btn-primary" onclick="location.href=\\'/init\\'"><i class="fas fa-cog"></i> 前往设置</button></div>';
-          // 调整高度（可能为空状态，也需要同步）
           setTimeout(adjustTableHeights, 50);
           return;
         }
         document.getElementById('total-backends').textContent = data.length;
-        // 构建表格和卡片
         let tableHtml = '<div class="stats-table-container"><table class="stats-table"><thead><tr><th>后端地址 / 健康</th><th>请求统计</th><th>性能指标</th><th>权重状态</th></tr></thead><tbody>';
         let cardsHtml = '<div class="mobile-cards">';
         data.forEach(b => {
@@ -1430,20 +1487,21 @@ async function handleStatusPage(request, env) {
           const ewma = (b.ewma_success_rate || 0.5).toFixed(3);
           const consec = b.consecutive_failures || 0;
           const healthy = b.healthy === 1;
-          const disabledUntil = b.disabled_until ? formatBeijingTime(b.disabled_until) : null;
+          const isCircuitOpen = b.disabled_until && new Date(b.disabled_until) > new Date();
           const dynamicWeight = b.dynamic_weight || b.weight || ${config.INITIAL_WEIGHT};
           const { level, className } = getWeightInfo(dynamicWeight);
-
-          // 表格行
+          let circuitHtml = '';
+          if (isCircuitOpen) {
+            circuitHtml = '<span class="status-badge status-failed" style="background:#e53e3e; color:white;">熔断中</span>';
+          }
           tableHtml += \`<tr>
             <td data-label="后端地址">
-              <div class="mobile-row"><strong>\${b.url || '未知'}</strong></div>
+              <div class="mobile-row"><strong>\${escapeHtml(b.url || '未知')}</strong></div>
               <div style="display:flex;flex-wrap:wrap;gap:6px;">
                 <span class="healthy-badge \${healthy ? 'healthy-true' : 'healthy-false'}">\${healthy ? '健康' : '不健康'}</span>
+                \${circuitHtml}
                 \${b.enabled === 0 ? '<span class="status-badge status-failed">已禁用</span>' : ''}
-                \${disabledUntil ? '<span class="status-badge status-failed">熔断至 '+disabledUntil+'</span>' : ''}
               </div>
-              <div style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">\${b.url || '未知'}</div>
             </td>
             <td data-label="请求统计">
               <div><small>总请求: \${total}</small></div>
@@ -1465,12 +1523,11 @@ async function handleStatusPage(request, env) {
               <div><span class="weight-badge \${className}" title="当前权重等级">\${level}</span></div>
             </td>
           </tr>\`;
-
-          // 卡片（地址横向滚动）
           cardsHtml += \`<div class="mobile-card">
             <div class="mobile-card-header">
-              <strong class="mobile-card-address" title="\${b.url || '未知'}">\${b.url || '未知'}</strong>
+              <strong class="mobile-card-address" title="\${escapeHtml(b.url || '未知')}">\${escapeHtml(b.url || '未知')}</strong>
               <span class="healthy-badge \${healthy ? 'healthy-true' : 'healthy-false'}">\${healthy ? '健康' : '不健康'}</span>
+              \${circuitHtml}
             </div>
             <div class="mobile-card-body">
               <div><span>总请求:</span> \${total}</div>
@@ -1482,7 +1539,6 @@ async function handleStatusPage(request, env) {
               <div><span>EWMA成功率:</span> \${ewma}</div>
               <div><span>连续失败:</span> \${consec}</div>
               <div><span>最后使用:</span> \${b.last_used ? formatBeijingTime(b.last_used) : '从未'}</div>
-              \${disabledUntil ? '<div><span>熔断至:</span> '+disabledUntil+'</div>' : ''}
               <div><span>健康检查:</span> \${b.last_health_check ? formatBeijingTime(b.last_health_check) : '从未'}</div>
             </div>
           </div>\`;
@@ -1490,7 +1546,6 @@ async function handleStatusPage(request, env) {
         tableHtml += '</tbody></table></div>';
         cardsHtml += '</div>';
         container.innerHTML = tableHtml + cardsHtml;
-        // 调整高度
         setTimeout(adjustTableHeights, 50);
       } catch (e) {
         addDebugLog('加载后端统计失败', { error: e.message });
@@ -1520,23 +1575,16 @@ async function handleStatusPage(request, env) {
           const statusText = r.status === 'success' ? '成功' : '失败';
           const weight = r.dynamic_weight || 0;
           const { level, className } = getWeightInfo(weight);
-
           tableHtml += \`<tr>
-            <td data-label="后端地址"><div class="mobile-row"><strong>\${r.backend_url || '未知'}</strong></div><div style="max-width:180px;overflow:hidden;text-overflow:ellipsis;">\${r.backend_url || '未知'}</div></td>
-            <td data-label="状态"><span class="status-badge \${statusClass}">\${statusText}</span>\${r.error_message ? '<div><small style="color:#718096;font-size:11px;">'+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</small></div>' : ''}</td>
-            <td data-label="动态权重">
-              <div class="weight-info">
-                <span class="weight-badge" title="请求时的动态权重">\${weight.toFixed(1)}</span>
-                <span class="weight-badge \${className}" style="margin-left:4px;" title="权重等级">\${level}</span>
-              </div>
-            </td>
+            <td data-label="后端地址"><div class="mobile-row"><strong>\${escapeHtml(r.backend_url || '未知')}</strong></div></td>
+            <td data-label="状态"><span class="status-badge \${statusClass}">\${statusText}</span>\${r.error_message ? '<div><small style="color:#718096;font-size:11px;">'+escapeHtml(r.error_message.substring(0,40))+(r.error_message.length>40?'...':'')+'</small></div>' : ''}</td>
+            <td data-label="动态权重"><div class="weight-info"><span class="weight-badge">\${weight.toFixed(1)}</span><span class="weight-badge \${className}" style="margin-left:4px;">\${level}</span></div></td>
             <td data-label="响应时间">\${formatResponseTime(r.response_time || 0)}</td>
             <td data-label="请求时间">\${formatBeijingTime(r.request_time || new Date().toISOString())}</td>
           </tr>\`;
-
           cardsHtml += \`<div class="mobile-card">
             <div class="mobile-card-header">
-              <strong class="mobile-card-address" title="\${r.backend_url || '未知'}">\${r.backend_url || '未知'}</strong>
+              <strong class="mobile-card-address" title="\${escapeHtml(r.backend_url || '未知')}">\${escapeHtml(r.backend_url || '未知')}</strong>
               <span class="status-badge \${statusClass}">\${statusText}</span>
             </div>
             <div class="mobile-card-body">
@@ -1544,20 +1592,29 @@ async function handleStatusPage(request, env) {
               <div><span>权重等级:</span> <span class="weight-badge \${className}">\${level}</span></div>
               <div><span>响应时间:</span> \${formatResponseTime(r.response_time || 0)}</div>
               <div><span>请求时间:</span> \${formatBeijingTime(r.request_time || new Date().toISOString())}</div>
-              \${r.error_message ? '<div><span>错误:</span> '+r.error_message.substring(0,40)+(r.error_message.length>40?'...':'')+'</div>' : ''}
+              \${r.error_message ? '<div><span>错误:</span> '+escapeHtml(r.error_message.substring(0,40))+(r.error_message.length>40?'...':'')+'</div>' : ''}
             </div>
           </div>\`;
         });
         tableHtml += '</tbody></table></div>';
         cardsHtml += '</div>';
         container.innerHTML = tableHtml + cardsHtml;
-        // 调整高度
         setTimeout(adjustTableHeights, 50);
       } catch (e) {
         addDebugLog('加载最近请求失败', { error: e.message });
         container.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i><h3>加载失败</h3><p>'+e.message+'</p><button class="btn btn-primary" onclick="loadRecentRequests()"><i class="fas fa-redo"></i> 重新加载</button></div>';
         setTimeout(adjustTableHeights, 50);
       }
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return str.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+      }).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     function refreshData() {
@@ -1567,24 +1624,18 @@ async function handleStatusPage(request, env) {
       loadRecentRequests();
     }
 
-    // 初始化
     document.addEventListener('DOMContentLoaded', () => {
       addDebugLog('页面加载完成');
       if (debugEnabled) { document.getElementById('debug-panel').style.display = 'block'; updateDebugPanel(); }
       document.getElementById('last-update-time').textContent = formatBeijingTime(new Date().toISOString());
       if (${backends.length} === 0) loadBackendStats();
       if (${requests.length} === 0) loadRecentRequests();
-      // 初始调整高度（如果已有数据）
       setTimeout(adjustTableHeights, 100);
       setInterval(refreshData, 120000);
       document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshData(); });
     });
 
-    // 监听窗口大小变化，重新调整高度
-    window.addEventListener('resize', () => {
-      adjustTableHeights();
-    });
-
+    window.addEventListener('resize', () => adjustTableHeights());
     document.addEventListener('keydown', (e) => {
       if (e.ctrlKey && e.key === 'r') { e.preventDefault(); refreshData(); addDebugLog('快捷键刷新'); }
       if (e.ctrlKey && e.key === 'd') { e.preventDefault(); toggleDebug(); }
@@ -1957,7 +2008,7 @@ async function handleInitPage(request, env) {
     </div>
     <div class="backend-list">
       <h3><i class="fas fa-list"></i> 默认后端服务器列表</h3>
-      ${config.DEFAULT_BACKENDS.map(url => `<div class="backend-url"><i class="fas fa-link"></i><span>${url}</span></div>`).join('')}
+      ${config.DEFAULT_BACKENDS.map(url => `<div class="backend-url"><i class="fas fa-link"></i><span>${escapeHtmlAttr(url)}</span></div>`).join('')}
     </div>
     <div id="message" class="message"></div>
     <div class="btn-group">
@@ -2063,21 +2114,6 @@ async function handleInitPage(request, env) {
   return new Response(html, {
     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
   });
-}
-
-// ---------- 辅助格式化函数 ----------
-function formatResponseTimeForHTML(ms) {
-  if (!ms || ms < 0) return '0ms';
-  return ms < 1000 ? ms.toFixed(0) + 'ms' : (ms / 1000).toFixed(2) + 's';
-}
-
-function formatBeijingTimeForHTML(isoString) {
-  if (!isoString) return '从未';
-  try {
-    return new Date(isoString).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  } catch {
-    return isoString;
-  }
 }
 
 // ---------- 主入口 ----------
