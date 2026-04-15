@@ -1,5 +1,5 @@
 // Cloudflare Worker 主文件
-// 订阅转换负载均衡系统（增强版）
+// 订阅转换负载均衡系统（增强版 + 自动重置恢复）
 
 // ---------- 工具函数：结构化日志 ----------
 let requestIdCounter = 0;
@@ -43,7 +43,7 @@ function getConfig(env) {
     CIRCUIT_BREAKER_THRESHOLD: parseInt(env.CIRCUIT_BREAKER_THRESHOLD) || 5,
     CIRCUIT_BREAKER_TIMEOUT: parseInt(env.CIRCUIT_BREAKER_TIMEOUT) || 300, // 秒
     HEALTH_CHECK_FAIL_THRESHOLD: parseInt(env.HEALTH_CHECK_FAIL_THRESHOLD) || 3,
-    HEALTH_CHECK_URL: env.HEALTH_CHECK_URL || '/sub?target=clash&url=https://www.google.com', // 默认健康检查URL
+    HEALTH_CHECK_URL: env.HEALTH_CHECK_URL || '/sub?target=clash&url=https://www.google.com',
     DEFAULT_BACKENDS: env.DEFAULT_BACKENDS ? JSON.parse(env.DEFAULT_BACKENDS) : [
       'https://url.v1.mk',
       'https://subapi.cmliussss.net',
@@ -51,6 +51,7 @@ function getConfig(env) {
       'https://subapi.fxxk.dedyn.io',
       'https://subapi.zrfme.com'
     ],
+    RESET_COOLDOWN_SECONDS: 3600, // 重置冷却时间1小时
   };
 }
 
@@ -99,6 +100,14 @@ const TABLE_SCHEMAS = {
       'CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(request_time DESC)',
       'CREATE INDEX IF NOT EXISTS idx_request_logs_backend ON request_logs(backend_url)'
     ]
+  },
+  system_config: {
+    columns: [
+      { name: 'key', type: 'TEXT PRIMARY KEY' },
+      { name: 'value', type: 'TEXT NOT NULL' },
+      { name: 'updated_at', type: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' }
+    ],
+    indexes: []
   }
 };
 
@@ -139,25 +148,138 @@ async function updateTableSchema(env, tableName) {
 }
 
 async function ensureDatabaseInitialized(env) {
+  // 检查三个表
   const backendExists = await checkTableExists(env, 'backend_servers');
   const logsExists = await checkTableExists(env, 'request_logs');
-  if (!backendExists || !logsExists) {
+  const configExists = await checkTableExists(env, 'system_config');
+  
+  if (!backendExists || !logsExists || !configExists) {
     await createDatabaseTables(env);
   } else {
     await updateTableSchema(env, 'backend_servers');
     await updateTableSchema(env, 'request_logs');
+    await updateTableSchema(env, 'system_config');
   }
   return true;
 }
 
 async function createDatabaseTables(env) {
+  // 创建 backend_servers
   const backendCols = TABLE_SCHEMAS.backend_servers.columns.map(c => `${c.name} ${c.type}`).join(',\n');
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS backend_servers (${backendCols})`).run();
+  // 创建 request_logs
   const logsCols = TABLE_SCHEMAS.request_logs.columns.map(c => `${c.name} ${c.type}`).join(',\n');
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS request_logs (${logsCols})`).run();
+  // 创建 system_config
+  const configCols = TABLE_SCHEMAS.system_config.columns.map(c => `${c.name} ${c.type}`).join(',\n');
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS system_config (${configCols})`).run();
+  
+  // 创建索引
   for (const idx of TABLE_SCHEMAS.backend_servers.indexes) await env.DB.prepare(idx).run();
   for (const idx of TABLE_SCHEMAS.request_logs.indexes) await env.DB.prepare(idx).run();
-  logInfo('数据库表创建完成');
+  
+  logInfo('数据库表创建完成（包含 system_config）');
+}
+
+// ---------- 系统配置读写 ----------
+async function getSystemConfig(env, key, defaultValue = null) {
+  try {
+    const result = await env.DB.prepare('SELECT value FROM system_config WHERE key = ?').bind(key).first();
+    return result ? result.value : defaultValue;
+  } catch (e) {
+    logError(`读取系统配置失败 key=${key}`, e);
+    return defaultValue;
+  }
+}
+
+async function setSystemConfig(env, key, value) {
+  try {
+    await env.DB.prepare(`
+      INSERT INTO system_config (key, value, updated_at) VALUES (?, ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+    `).bind(key, value).run();
+  } catch (e) {
+    logError(`写入系统配置失败 key=${key}`, e);
+  }
+}
+
+// ---------- 重置数据库到默认后端 ----------
+async function resetDatabaseToDefaults(env, config, reqId) {
+  logInfo('开始重置数据库到默认后端', { backends: config.DEFAULT_BACKENDS }, reqId);
+  try {
+    // 清空现有数据
+    await env.DB.prepare('DELETE FROM backend_servers').run();
+    await env.DB.prepare('DELETE FROM request_logs').run();
+    
+    // 插入默认后端
+    let inserted = 0, errors = [];
+    for (const url of config.DEFAULT_BACKENDS) {
+      try {
+        await env.DB.prepare(`
+          INSERT INTO backend_servers (url, weight, dynamic_weight, ewma_success_rate, healthy, health_check_failures)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).bind(url, config.INITIAL_WEIGHT, config.INITIAL_WEIGHT, 0.5, 1, 0).run();
+        inserted++;
+      } catch (e) {
+        errors.push({ url, error: e.message });
+      }
+    }
+    
+    // 更新重置时间戳和计数
+    const now = new Date().toISOString();
+    await setSystemConfig(env, 'last_reset_time', now);
+    let resetCount = parseInt(await getSystemConfig(env, 'reset_count', '0')) || 0;
+    await setSystemConfig(env, 'reset_count', String(resetCount + 1));
+    
+    logInfo('数据库重置完成', { inserted, errors, totalBackends: config.DEFAULT_BACKENDS.length }, reqId);
+    return { success: true, inserted, errors };
+  } catch (error) {
+    logError('数据库重置失败', error, reqId);
+    return { success: false, error: error.message };
+  }
+}
+
+// ---------- 检测所有后端是否均不可用，若是则尝试重置 ----------
+async function checkAndResetIfAllUnhealthy(env, config, reqId) {
+  const now = new Date();
+  const nowISO = now.toISOString();
+  
+  // 查询当前可用的后端数量（enabled=1, healthy=1, 且未熔断）
+  const availableQuery = `
+    SELECT COUNT(*) as count FROM backend_servers 
+    WHERE enabled = 1 AND healthy = 1 
+      AND (disabled_until IS NULL OR disabled_until < ?)
+  `;
+  const availableResult = await env.DB.prepare(availableQuery).bind(nowISO).first();
+  const availableCount = availableResult?.count || 0;
+  
+  if (availableCount > 0) {
+    logDebug('存在可用后端，无需重置', { availableCount }, reqId);
+    return false;
+  }
+  
+  logInfo('检测到所有后端均不可用', { availableCount }, reqId);
+  
+  // 检查重置冷却时间
+  const lastReset = await getSystemConfig(env, 'last_reset_time', null);
+  if (lastReset) {
+    const lastResetTime = new Date(lastReset);
+    const secondsSinceLastReset = (now - lastResetTime) / 1000;
+    if (secondsSinceLastReset < config.RESET_COOLDOWN_SECONDS) {
+      logInfo('重置冷却期内，跳过自动重置', { secondsSinceLastReset, cooldown: config.RESET_COOLDOWN_SECONDS }, reqId);
+      return false;
+    }
+  }
+  
+  // 执行重置
+  logInfo('所有后端不可用且冷却期已过，开始自动重置数据库', null, reqId);
+  const resetResult = await resetDatabaseToDefaults(env, config, reqId);
+  if (resetResult.success) {
+    logInfo('自动重置成功，后端已恢复', { inserted: resetResult.inserted }, reqId);
+  } else {
+    logError('自动重置失败', new Error(resetResult.error), reqId);
+  }
+  return resetResult.success;
 }
 
 // ---------- 智能权重计算 ----------
@@ -171,7 +293,7 @@ function computeDynamicWeight(baseWeight, ewma, avgResponseTime, consecutiveFail
   return weight;
 }
 
-// ---------- 被动健康检查触发（使用请求的订阅地址）----------
+// ---------- 被动健康检查触发 ----------
 async function triggerPassiveHealthCheck(env, backendId, backendUrl, testUrl, config, reqId) {
   try {
     logInfo(`触发被动健康检查: ${backendUrl}`, { testUrl }, reqId);
@@ -385,6 +507,8 @@ async function handleSubscriptionRequest(request, env, ctx) {
     const backend = await selectBackend(env, config, Array.from(triedIds), reqId);
     if (!backend) {
       logError(`第${attempt}次尝试: 无可用后端`, null, reqId);
+      // 无可用后端时触发异步重置（带冷却检查）
+      ctx.waitUntil(checkAndResetIfAllUnhealthy(env, config, reqId).catch(e => logError('后台重置检查失败', e, reqId)));
       break;
     }
     triedIds.add(backend.id);
@@ -595,6 +719,8 @@ async function scheduled(event, env, ctx) {
   const type = event.cron;
   if (type === '*/30 * * * *') {
     await scheduledHealthCheck(env, config, ctx);
+    // 健康检查后检测是否所有后端都不可用，若是则自动重置
+    await checkAndResetIfAllUnhealthy(env, config, 'scheduled-reset');
   } else if (type === '0 * * * *') {
     await cleanupOldLogs(env, config, 'cron');
   }
@@ -649,23 +775,14 @@ async function handleInitDatabase(request, env) {
   const config = getConfig(env);
   try {
     await ensureDatabaseInitialized(env);
-    await env.DB.prepare('DELETE FROM backend_servers').run();
-    await env.DB.prepare('DELETE FROM request_logs').run();
-
-    let inserted = 0, errors = [];
-    for (const url of config.DEFAULT_BACKENDS) {
-      try {
-        await env.DB.prepare(`
-          INSERT INTO backend_servers (url, weight, dynamic_weight, ewma_success_rate, healthy, health_check_failures)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).bind(url, config.INITIAL_WEIGHT, config.INITIAL_WEIGHT, 0.5, 1, 0).run();
-        inserted++;
-      } catch (e) {
-        errors.push({ url, error: e.message });
-      }
+    // 直接使用重置逻辑，清空并插入默认后端
+    const result = await resetDatabaseToDefaults(env, config, reqId);
+    if (result.success) {
+      logInfo('数据库初始化完成', { inserted: result.inserted, errors: result.errors }, reqId);
+    } else {
+      logError('数据库初始化失败', new Error(result.error), reqId);
     }
-    logInfo('数据库初始化完成', { inserted, errors }, reqId);
-    return new Response(JSON.stringify({ success: true, backends_added: inserted, errors }), {
+    return new Response(JSON.stringify(result), {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   } catch (error) {

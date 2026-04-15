@@ -1,6 +1,7 @@
 name = "subconverter-loadbalancer"
 main = "src/worker.js"
 compatibility_date = "2024-01-01"
+keep_vars = true
 
 [[d1_databases]]
 binding = "DB"
@@ -17,6 +18,7 @@ MAX_LOG_ENTRIES = "50"             # 保留最近请求日志条数
 CIRCUIT_BREAKER_THRESHOLD = "5"    # 连续失败熔断阈值
 CIRCUIT_BREAKER_TIMEOUT = "1800"    # 熔断冷却时间（秒），默认30分钟
 HEALTH_CHECK_FAIL_THRESHOLD = "5"  # 健康检查连续失败阈值
+RESET_COOLDOWN_SECONDS = "3600"  # 重置冷却时间1小时
 DEFAULT_BACKENDS = '["https://url.v1.mk","https://subapi.cmliussss.net","https://subapi.sosoorg.com","https://subapi.fxxk.dedyn.io","https://subapi.zrfme.com"]'
 
 # 定时触发器（每30分钟执行健康检查，每1小时清理旧日志）
